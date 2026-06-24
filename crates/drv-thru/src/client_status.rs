@@ -116,6 +116,16 @@ impl StatusLine {
         self.draw_now();
     }
 
+    fn transfer_message(&mut self, message: impl Into<String>) {
+        if let Some(Status::Transfer {
+            message: current, ..
+        }) = &mut self.current
+        {
+            *current = message.into();
+            self.draw_now();
+        }
+    }
+
     fn add_transfer_bytes(&mut self, bytes: u64) {
         if bytes == 0 || self.last_draw.elapsed() < Duration::from_millis(100) {
             return;
@@ -164,6 +174,13 @@ impl TransferProgress {
             inner,
             bytes: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub fn message(&self, message: impl Into<String>) {
+        self.inner
+            .lock()
+            .expect("status lock poisoned")
+            .transfer_message(message);
     }
 
     pub fn add_bytes(&self, bytes: u64) {

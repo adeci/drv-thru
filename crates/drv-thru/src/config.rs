@@ -11,6 +11,7 @@ use serde::Deserialize;
 pub const DEFAULT_MAX_BUILD_TIME: &str = "30m";
 pub const DEFAULT_MAX_UPLOAD_BYTES: &str = "20G";
 pub const DEFAULT_MAX_CONCURRENT_BUILDS: usize = 1;
+pub const MAX_AUTO_CACHE_FILLS: usize = 16;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,6 +21,8 @@ pub struct ServerConfig {
     pub secret_key_file: Option<PathBuf>,
     #[serde(default = "default_max_concurrent_builds")]
     pub max_concurrent_builds: usize,
+    #[serde(default)]
+    pub output_cache_max_parallel_fills: Option<usize>,
     #[serde(default)]
     pub trusted_clients: BTreeMap<String, TrustedClient>,
 }
@@ -53,6 +56,9 @@ pub fn load_server_config(path: impl AsRef<Path>) -> Result<ServerConfig> {
         serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
     if config.max_concurrent_builds == 0 {
         bail!("max_concurrent_builds must be at least 1");
+    }
+    if config.output_cache_max_parallel_fills == Some(0) {
+        bail!("output_cache_max_parallel_fills must be at least 1");
     }
     Ok(config)
 }
@@ -120,6 +126,7 @@ mod tests {
         assert_eq!(config.data_dir, PathBuf::from("/tmp/drv-thru"));
         assert!(config.secret_key_file.is_none());
         assert_eq!(config.max_concurrent_builds, DEFAULT_MAX_CONCURRENT_BUILDS);
+        assert_eq!(config.output_cache_max_parallel_fills, None);
         assert!(config.trusted_clients.is_empty());
     }
 
@@ -157,6 +164,16 @@ mod tests {
     }
 
     #[test]
+    fn server_config_accepts_output_cache_max_parallel_fills() {
+        let config: ServerConfig = serde_json::from_str(
+            r#"{"data_dir":"/tmp/drv-thru","output_cache_max_parallel_fills":8}"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.output_cache_max_parallel_fills, Some(8));
+    }
+
+    #[test]
     fn load_server_config_rejects_zero_max_concurrent_builds() {
         let path = std::env::temp_dir().join(format!(
             "drv-thru-zero-max-concurrent-builds-{}.json",
@@ -165,6 +182,23 @@ mod tests {
         fs::write(
             &path,
             r#"{"data_dir":"/tmp/drv-thru","max_concurrent_builds":0}"#,
+        )
+        .unwrap();
+
+        assert!(load_server_config(&path).is_err());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_server_config_rejects_zero_output_cache_max_parallel_fills() {
+        let path = std::env::temp_dir().join(format!(
+            "drv-thru-zero-output-cache-max-parallel-fills-{}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"{"data_dir":"/tmp/drv-thru","output_cache_max_parallel_fills":0}"#,
         )
         .unwrap();
 

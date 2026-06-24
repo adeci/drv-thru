@@ -21,7 +21,10 @@ use tokio::{
 use crate::{
     access::AccessPolicy,
     cache,
-    config::{DEFAULT_MAX_CONCURRENT_BUILDS, load_server_config, parse_byte_count, parse_duration},
+    config::{
+        DEFAULT_MAX_CONCURRENT_BUILDS, MAX_AUTO_CACHE_FILLS, load_server_config, parse_byte_count,
+        parse_duration,
+    },
     keys, nix,
     proto::{
         ALPN, AuthOk, BuildFinished, BuildRequest, CacheFileResponse, ErrorMessage, Message,
@@ -39,6 +42,13 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 const CLIENT_NIX_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn default_output_cache_max_parallel_fills() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .clamp(1, MAX_AUTO_CACHE_FILLS)
+}
 
 pub enum ServeMode {
     DataDir {
@@ -67,7 +77,13 @@ struct AuthorizedConnection {
 }
 
 pub async fn serve(mode: ServeMode) -> Result<()> {
-    let (data_dir, secret_key_file, access_policy, max_concurrent_builds) = match mode {
+    let (
+        data_dir,
+        secret_key_file,
+        access_policy,
+        max_concurrent_builds,
+        output_cache_max_parallel_fills,
+    ) = match mode {
         ServeMode::DataDir {
             data_dir,
             trusted_clients,
@@ -76,6 +92,7 @@ pub async fn serve(mode: ServeMode) -> Result<()> {
             None,
             AccessPolicy::from_endpoint_ids(trusted_clients),
             DEFAULT_MAX_CONCURRENT_BUILDS,
+            None,
         ),
         ServeMode::Config(path) => {
             let config = load_server_config(&path)?;
@@ -85,12 +102,20 @@ pub async fn serve(mode: ServeMode) -> Result<()> {
                 config.secret_key_file,
                 access_policy,
                 config.max_concurrent_builds,
+                config.output_cache_max_parallel_fills,
             )
         }
     };
 
     let signing_key = Arc::new(keys::load_or_create_signing_key(&data_dir)?);
-    let output_cache = Arc::new(output_cache::OutputCache::new(&data_dir, signing_key)?);
+    let output_cache_max_parallel_fills =
+        output_cache_max_parallel_fills.unwrap_or_else(default_output_cache_max_parallel_fills);
+    println!("output cache max parallel fills: {output_cache_max_parallel_fills}");
+    let output_cache = Arc::new(output_cache::OutputCache::new(
+        &data_dir,
+        signing_key,
+        output_cache_max_parallel_fills,
+    )?);
     let key_path = secret_key_file.unwrap_or_else(|| keys::server_key_path(&data_dir));
     let key = keys::load_or_create(key_path)?;
     let endpoint = Endpoint::builder(presets::N0)

@@ -15,6 +15,7 @@ let
     data_dir = serverCfg.dataDir;
     secret_key_file = serverCfg.secretKeyFile;
     max_concurrent_builds = serverCfg.maxConcurrentBuilds;
+    output_cache_max_parallel_fills = serverCfg.outputCacheMaxParallelFills;
     trusted_clients = lib.mapAttrs (_: client: {
       public_key = client.publicKey;
       max_build_time = client.maxBuildTime;
@@ -53,6 +54,12 @@ in
         type = lib.types.ints.positive;
         default = 1;
         description = "Maximum active builds processed at once.";
+      };
+
+      outputCacheMaxParallelFills = lib.mkOption {
+        type = lib.types.nullOr lib.types.ints.positive;
+        default = null;
+        description = "Maximum signed cache entries generated in parallel. null uses an automatic CPU-based default.";
       };
 
       trustedClients = lib.mkOption {

@@ -221,6 +221,7 @@ services.drv-thru = {
     dataDir = "/var/lib/drv-thru";
     secretKeyFile = "/var/lib/drv-thru/secret.key";
     maxConcurrentBuilds = 1;
+    outputCacheMaxParallelFills = null; # auto, based on CPU count; set e.g. 8 to tune
 
     trustedClients.alex = {
       publicKey = "client-iroh-endpoint-id";

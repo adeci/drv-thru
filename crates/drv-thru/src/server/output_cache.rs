@@ -1,7 +1,6 @@
 use super::*;
 
 const NIX_CACHE_INFO: &[u8] = b"StoreDir: /nix/store\n";
-const MAX_PARALLEL_CACHE_FILLS: usize = 4;
 
 #[derive(Clone)]
 pub(super) struct OutputCache {
@@ -12,7 +11,11 @@ pub(super) struct OutputCache {
 }
 
 impl OutputCache {
-    pub(super) fn new(data_dir: &Path, signing_key: Arc<keys::SigningKey>) -> Result<Self> {
+    pub(super) fn new(
+        data_dir: &Path,
+        signing_key: Arc<keys::SigningKey>,
+        max_parallel_fills: usize,
+    ) -> Result<Self> {
         let dir = data_dir
             .join("cache")
             .join(signing_cache_dir_name(&signing_key.public_key));
@@ -21,7 +24,7 @@ impl OutputCache {
             dir,
             signing_key,
             fill_locks: Arc::new(Mutex::new(BTreeMap::new())),
-            fill_permits: Arc::new(Semaphore::new(MAX_PARALLEL_CACHE_FILLS)),
+            fill_permits: Arc::new(Semaphore::new(max_parallel_fills)),
         })
     }
 
@@ -90,7 +93,9 @@ pub(super) async fn export_outputs(
         return wire::write_json(send, &Message::Done).await;
     }
 
-    let access = OutputCacheAccess::new(&requested);
+    // Nix may query narinfos for references of requested paths while computing the copy closure.
+    // Serve any path in the output closure, but ask Nix to copy only the paths missing locally.
+    let access = OutputCacheAccess::new(&closure);
 
     wire::write_json(
         send,

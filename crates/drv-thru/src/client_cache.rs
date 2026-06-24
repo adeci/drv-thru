@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use indicatif::HumanBytes;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -85,7 +86,11 @@ async fn import_outputs_from_cache(
         .collect::<Result<Vec<_>>>()?;
     status.phase("checking output import trust");
     let import_method = output_import_method(builder_public_key).await?;
-    let message = format!("recv {} {}", copy_paths.len(), path_word(copy_paths.len()));
+    let message = format!(
+        "preparing signed cache for {} {}",
+        copy_paths.len(),
+        path_word(copy_paths.len())
+    );
     let progress = status.transfer(message);
     let bridge = CacheBridge::start(conn, progress.clone()).await?;
 
@@ -265,9 +270,11 @@ async fn run_cache_bridge(
                 tasks.spawn(async move {
                     if let Err(err) = handle_cache_http(stream, conn, progress).await {
                         let message = err.to_string();
-                        eprintln!("cache bridge request failed: {message}");
-                        if let Ok(mut first_error) = first_error.lock() {
-                            first_error.get_or_insert(message);
+                        if let Ok(mut first_error) = first_error.lock()
+                            && first_error.is_none()
+                        {
+                            eprintln!("cache bridge request failed: {message}");
+                            *first_error = Some(message);
                         }
                     }
                 });
@@ -318,6 +325,10 @@ async fn handle_cache_http(
     };
 
     let send_body = matches!(request.method, HttpMethod::Get);
+    progress.message(format!(
+        "preparing signed cache {}",
+        cache_status_path(&path)
+    ));
     let fetched = match fetch_cache_file(&conn, &path, send_body).await {
         Ok(fetched) => fetched,
         Err(err) => {
@@ -332,10 +343,12 @@ async fn handle_cache_http(
     };
 
     let Some(mut fetched) = fetched else {
+        progress.message(format!("cache miss {}", cache_status_path(&path)));
         write_http_error(&mut stream, 404, &format!("cache file not found: {path}\n")).await?;
         bail!("cache bridge returned 404 for {path}");
     };
 
+    progress.message(cache_transfer_message(&path, send_body, fetched.byte_count));
     write_http_head(&mut stream, 200, fetched.byte_count).await?;
     if let Some(body) = fetched.body.take() {
         let mut body = ProgressReader::new(body.take(fetched.byte_count), progress);
@@ -359,6 +372,39 @@ enum HttpMethod {
     Get,
     Head,
     Other,
+}
+
+fn cache_transfer_message(path: &str, send_body: bool, byte_count: u64) -> String {
+    if send_body {
+        format!(
+            "recv {} {}",
+            cache_status_path(path),
+            HumanBytes(byte_count)
+        )
+    } else {
+        format!(
+            "cache metadata {} {} head",
+            cache_status_path(path),
+            HumanBytes(byte_count)
+        )
+    }
+}
+
+fn cache_status_path(path: &str) -> String {
+    if path.len() <= 72 {
+        return path.to_string();
+    }
+
+    let start = path.chars().take(40).collect::<String>();
+    let end = path
+        .chars()
+        .rev()
+        .take(24)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{start}...{end}")
 }
 
 struct FetchedCacheFile {
