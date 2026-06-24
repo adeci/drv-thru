@@ -8,6 +8,7 @@ let
   cfg = config.services.drv-thru;
   serverCfg = cfg.server;
   clientCfg = cfg.client;
+  ticketHelperCfg = clientCfg.ticketHelper;
   json = pkgs.formats.json { };
 
   serverConfig = json.generate "drv-thru-server.json" {
@@ -110,6 +111,16 @@ in
           }
         );
       };
+
+      ticketHelper = {
+        enable = lib.mkEnableOption "drv-thru local ticket import helper";
+
+        group = lib.mkOption {
+          type = lib.types.str;
+          default = "drv-thru";
+          description = "Group allowed to use the local drv-thru import helper. Members can import signed store paths from ticket builders.";
+        };
+      };
     };
   };
 
@@ -117,8 +128,9 @@ in
     {
       assertions = [
         {
-          assertion = (!serverCfg.enable && !clientCfg.enable) || cfg.package != null;
-          message = "services.drv-thru.package must be set when the drv-thru server or client is enabled.";
+          assertion =
+            (!serverCfg.enable && !clientCfg.enable && !ticketHelperCfg.enable) || cfg.package != null;
+          message = "services.drv-thru.package must be set when the drv-thru server, client, or client ticket helper is enabled.";
         }
       ];
     }
@@ -129,6 +141,27 @@ in
 
     (lib.mkIf clientCfg.enable {
       environment.systemPackages = [ cfg.package ];
+    })
+
+    (lib.mkIf ticketHelperCfg.enable {
+      users.groups.${ticketHelperCfg.group} = { };
+
+      systemd.services.drv-thru-import-helper = {
+        description = "drv-thru local ticket import helper";
+        path = [ pkgs.nix ];
+        wantedBy = [ "multi-user.target" ];
+        after = [ "nix-daemon.service" ];
+
+        serviceConfig = {
+          ExecStart = "${lib.getExe cfg.package} import-helper serve --socket /run/drv-thru/import-helper.sock";
+          User = "root";
+          Group = ticketHelperCfg.group;
+          RuntimeDirectory = "drv-thru";
+          RuntimeDirectoryMode = "0750";
+          UMask = "0007";
+          Restart = "on-failure";
+        };
+      };
     })
 
     (lib.mkIf serverCfg.enable {

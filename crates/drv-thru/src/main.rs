@@ -4,6 +4,7 @@ mod cli;
 mod client;
 mod client_status;
 mod config;
+mod import_helper;
 mod keys;
 mod nix;
 mod proto;

@@ -1,4 +1,8 @@
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use indicatif::HumanBytes;
@@ -20,7 +24,7 @@ const CACHE_FILE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 use crate::{
     cache,
     client_status::{ClientStatus, ProgressReader, ProgressWriter, TransferProgress},
-    keys, nix,
+    import_helper, keys, nix,
     proto::{
         ALPN, AuthTicket, BuildFinished, BuildRequest, CacheFileRequest, CacheFileResponse, Hello,
         Message, OutputCacheReady, OutputMode, PathListChunk, VERSION,
@@ -404,18 +408,36 @@ async fn import_outputs_from_cache(
         .cloned()
         .map(nix::StorePath::new)
         .collect::<Result<Vec<_>>>()?;
-    let import_trust = nix::signed_cache_import_trust(&cache.public_key).await?;
+    let import_method = output_import_method(&cache.public_key).await?;
     let message = format!("recv {} {}", copy_paths.len(), path_word(copy_paths.len()));
     let progress = status.transfer(message);
     let bridge = CacheBridge::start(conn, progress.clone()).await?;
 
-    let copy_result = nix::copy_from_signed_binary_cache(
-        bridge.url(),
-        &cache.public_key,
-        import_trust,
-        &copy_paths,
-    )
-    .await;
+    let copy_result = match import_method {
+        OutputImportMethod::Direct(import_trust) => {
+            nix::copy_from_signed_binary_cache(
+                bridge.url(),
+                &cache.public_key,
+                import_trust,
+                &copy_paths,
+            )
+            .await
+        }
+        OutputImportMethod::Helper => {
+            import_helper::import_paths(
+                Path::new(import_helper::DEFAULT_SOCKET_PATH),
+                import_helper::ImportRequest {
+                    builder_public_key: cache.public_key.clone(),
+                    cache_url: bridge.url().to_string(),
+                    paths: copy_paths
+                        .iter()
+                        .map(|path| path.as_str().to_string())
+                        .collect(),
+                },
+            )
+            .await
+        }
+    };
     let bridge_result = bridge.shutdown().await;
     let bytes = progress.bytes();
     progress.finish_and_clear();
@@ -428,6 +450,39 @@ async fn import_outputs_from_cache(
             Err(copy_err).with_context(|| bridge_err.to_string())
         }
         (Err(copy_err), Err(_)) => Err(copy_err),
+    }
+}
+
+async fn output_import_method(public_key: &str) -> Result<OutputImportMethod> {
+    match nix::signed_cache_import_trust(public_key).await {
+        Ok(trust) => Ok(OutputImportMethod::Direct(trust)),
+        Err(err) => {
+            let helper_socket = Path::new(import_helper::DEFAULT_SOCKET_PATH);
+            match choose_output_import_method(
+                Err(err.to_string()),
+                import_helper::helper_socket_exists(helper_socket),
+            ) {
+                Ok(method) => Ok(method),
+                Err(message) => bail!("{message}"),
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum OutputImportMethod {
+    Direct(nix::SignedCacheImportTrust),
+    Helper,
+}
+
+fn choose_output_import_method(
+    direct_import: Result<nix::SignedCacheImportTrust, String>,
+    helper_socket_available: bool,
+) -> Result<OutputImportMethod, String> {
+    match direct_import {
+        Ok(trust) => Ok(OutputImportMethod::Direct(trust)),
+        Err(_) if helper_socket_available => Ok(OutputImportMethod::Helper),
+        Err(err) => Err(err),
     }
 }
 
@@ -861,4 +916,42 @@ fn short_endpoint_id(id: EndpointId) -> String {
         .rev()
         .collect();
     format!("{start}...{end}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trusted_user_uses_direct_nix_copy() {
+        assert_eq!(
+            choose_output_import_method(Ok(nix::SignedCacheImportTrust::CanPassPublicKey), true)
+                .unwrap(),
+            OutputImportMethod::Direct(nix::SignedCacheImportTrust::CanPassPublicKey)
+        );
+    }
+
+    #[test]
+    fn globally_trusted_builder_key_uses_direct_nix_copy_without_restricted_options() {
+        assert_eq!(
+            choose_output_import_method(Ok(nix::SignedCacheImportTrust::KeyAlreadyTrusted), true)
+                .unwrap(),
+            OutputImportMethod::Direct(nix::SignedCacheImportTrust::KeyAlreadyTrusted)
+        );
+    }
+
+    #[test]
+    fn untrusted_user_with_helper_socket_uses_helper() {
+        assert_eq!(
+            choose_output_import_method(Err("setup required".to_string()), true).unwrap(),
+            OutputImportMethod::Helper
+        );
+    }
+
+    #[test]
+    fn untrusted_user_without_helper_socket_gets_clear_failure() {
+        let err = choose_output_import_method(Err("setup required".to_string()), false)
+            .expect_err("expected setup failure");
+        assert_eq!(err, "setup required");
+    }
 }

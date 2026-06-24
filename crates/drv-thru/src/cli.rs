@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use crate::{
     client::{self, BuildAuth},
     config::{parse_byte_count, parse_duration},
-    keys,
+    import_helper, keys,
     proto::OutputMode,
     server, ticket,
 };
@@ -59,6 +59,11 @@ enum Command {
         #[command(subcommand)]
         command: TicketCommand,
     },
+    #[command(name = "import-helper", hide = true)]
+    ImportHelper {
+        #[command(subcommand)]
+        command: ImportHelperCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -66,6 +71,14 @@ enum KeyCommand {
     Show {
         #[arg(long)]
         key_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImportHelperCommand {
+    Serve {
+        #[arg(long)]
+        socket: PathBuf,
     },
 }
 
@@ -167,6 +180,9 @@ pub async fn run() -> Result<()> {
             ),
             TicketCommand::Inspect { data_dir, ticket } => inspect_ticket(data_dir, ticket),
         },
+        Command::ImportHelper {
+            command: ImportHelperCommand::Serve { socket },
+        } => import_helper::serve(socket).await,
     }
 }
 

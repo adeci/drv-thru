@@ -264,7 +264,7 @@ pub async fn copy_to_signed_binary_cache(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignedCacheImportTrust {
     CanPassPublicKey,
     KeyAlreadyTrusted,
@@ -296,7 +296,7 @@ pub async fn signed_cache_import_trust(public_key: &str) -> Result<SignedCacheIm
         "Nix will reject this signed cache import.\n\n\
          This user is not a trusted Nix user, and the builder key is not in\n\
          trusted-public-keys:\n\n  {public_key}\n\n\
-         Fix one of:\n  - add the builder key to nix.settings.trusted-public-keys\n  - run drv-thru as a trusted Nix user\n  - install the drv-thru client helper (planned)"
+         Fix one of:\n  - add the builder key to nix.settings.trusted-public-keys\n  - run drv-thru as a trusted Nix user\n  - enable services.drv-thru.client.ticketHelper and add this user to its group"
     );
 }
 

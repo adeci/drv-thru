@@ -87,11 +87,20 @@ services.drv-thru = {
       publicKey = "drv-thru:builder-signing-public-key";
       relayUrl = null;
     };
+
+    # Optional: lets normal users in this group use one-off tickets
+    # from builders not already listed in trustedBuilders.
+    ticketHelper = {
+      enable = true;
+      group = "drv-thru";
+    };
   };
 };
 ```
 
 `client.trustedBuilders.*.publicKey` is appended to `nix.settings.trusted-public-keys`. `endpointId` and `relayUrl` record builder dialing info; builds still pass `--server`/`--relay-url` or `--ticket` today.
+
+The ticket helper is optional. Users in `client.ticketHelper.group` can import signed paths from ticket builders through a local root helper, so treat that group as local import trust.
 
 ## Usage
 
@@ -153,7 +162,7 @@ drv-thru build nixpkgs#hello \
 - Tickets are bearer credentials. Whoever redeems a one-use ticket first gets the build. Share them like passwords.
 - Trusted client keys are long-lived server access. Use them for machines or people the builder owner already trusts.
 - Client store import trust is separate: the client must run as root/a trusted Nix user, or the builder signing key must be in `nix.settings.trusted-public-keys`.
-- Tickets work today for trusted Nix users or clients that already trust the builder key. The planned client helper will handle one-time setup and arbitrary tickets.
+- Tickets work for trusted Nix users, clients that already trust the builder key, or users allowed to use the client import helper. Treat that helper group as local import trust.
 - NixOS module state lives in `/var/lib/drv-thru`.
 - Wheel users can create/admin tickets; the server secret key stays private to the `drv-thru` service user.
 - Trusted-client builds use a persistent client key at `~/.config/drv-thru/secret.key`.
