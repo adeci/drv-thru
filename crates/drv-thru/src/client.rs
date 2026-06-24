@@ -414,9 +414,23 @@ async fn import_outputs_from_cache(
     let bytes = progress.bytes();
     progress.finish_and_clear();
 
-    copy_result?;
-    bridge_result?;
-    Ok(bytes)
+    match (copy_result, bridge_result) {
+        (Ok(()), Ok(())) => Ok(bytes),
+        (Err(err), Ok(())) => Err(err),
+        (Ok(()), Err(err)) => Err(err),
+        (Err(copy_err), Err(bridge_err)) if cache_bridge_status_error(&bridge_err) => {
+            Err(copy_err).with_context(|| bridge_err.to_string())
+        }
+        (Err(copy_err), Err(_)) => Err(copy_err),
+    }
+}
+
+fn cache_bridge_status_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let message = cause.to_string();
+        message.starts_with("cache bridge returned 404")
+            || message.starts_with("cache bridge returned 502")
+    })
 }
 
 struct CacheBridge {
@@ -511,14 +525,15 @@ async fn handle_cache_http(
     let fetched = match fetch_cache_file(&conn, &path, send_body).await {
         Ok(fetched) => fetched,
         Err(err) => {
-            let _ = write_http_head(&mut stream, 502, 0).await;
-            return Err(err);
+            let _ =
+                write_http_error(&mut stream, 502, &format!("cache fetch failed: {path}\n")).await;
+            return Err(err).with_context(|| format!("cache bridge returned 502 for {path}"));
         }
     };
 
     let Some(mut fetched) = fetched else {
-        write_http_head(&mut stream, 404, 0).await?;
-        return Ok(());
+        write_http_error(&mut stream, 404, &format!("cache file not found: {path}\n")).await?;
+        bail!("cache bridge returned 404 for {path}");
     };
 
     write_http_head(&mut stream, 200, fetched.byte_count).await?;
@@ -650,6 +665,14 @@ async fn write_http_head(stream: &mut TcpStream, code: u16, content_length: u64)
         .write_all(response.as_bytes())
         .await
         .context("write HTTP response")
+}
+
+async fn write_http_error(stream: &mut TcpStream, code: u16, message: &str) -> Result<()> {
+    write_http_head(stream, code, message.len() as u64).await?;
+    stream
+        .write_all(message.as_bytes())
+        .await
+        .context("write HTTP error body")
 }
 
 enum LogRenderer {
@@ -797,7 +820,12 @@ fn print_build_summary(status: &ClientStatus, summary: BuildSummary<'_>) {
             summary.output_paths.len(),
             path_word(summary.output_paths.len())
         );
-        println!("{:<12} {}", "received", HumanBytes(summary.received_bytes));
+        println!(
+            "{:<12} {} ({} bytes)",
+            "received",
+            HumanBytes(summary.received_bytes),
+            summary.received_bytes
+        );
         println!();
         println!("output paths:");
         for path in summary.output_paths {

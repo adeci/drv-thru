@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     path::Path,
     process::{Output, Stdio},
@@ -43,12 +43,28 @@ pub async fn resolve_derivation(installable: &str) -> Result<StorePath> {
 }
 
 pub async fn resolve_outputs(installable: &str) -> Result<Vec<StorePath>> {
-    let output = run_command("nix", &["path-info", installable]).await?;
-    output
-        .lines()
-        .filter_map(non_empty_line)
+    let output = run_command("nix", &["build", "--dry-run", "--json", installable]).await?;
+    parse_build_plan_outputs(&output)
+}
+
+fn parse_build_plan_outputs(output: &str) -> Result<Vec<StorePath>> {
+    let plan: Vec<BuildPlanEntry> =
+        serde_json::from_str(output).context("parse nix build dry-run output")?;
+    if plan.len() != 1 {
+        bail!("expected one build plan entry, got {}", plan.len());
+    }
+    plan.into_iter()
+        .next()
+        .expect("checked length")
+        .outputs
+        .into_values()
         .map(StorePath::new)
         .collect()
+}
+
+#[derive(serde::Deserialize)]
+struct BuildPlanEntry {
+    outputs: BTreeMap<String, String>,
 }
 
 pub async fn closure(path: &StorePath) -> Result<Vec<StorePath>> {
@@ -275,7 +291,15 @@ pub async fn copy_from_signed_binary_cache(
             public_key.to_string(),
         ];
         args.extend(chunk.iter().map(|path| path.as_str().to_string()));
-        run_nix_command(args, "nix copy from signed binary cache").await?;
+        if let Err(err) = run_nix_command(args, "nix copy from signed binary cache").await {
+            let message = err.to_string();
+            if is_signature_or_trust_error(&message) {
+                bail!(
+                    "signed cache/public key import failed; Nix rejected cache signatures/trust: {message}"
+                );
+            }
+            return Err(err);
+        }
     }
     Ok(())
 }
@@ -412,6 +436,15 @@ fn non_empty_line(line: &str) -> Option<String> {
     (!line.is_empty()).then(|| line.to_string())
 }
 
+fn is_signature_or_trust_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("signature")
+        || message.contains("trusted public")
+        || message.contains("trusted-public-keys")
+        || message.contains("trusted key")
+        || message.contains("public key")
+}
+
 async fn run_command(program: &str, args: &[&str]) -> Result<String> {
     let output = command_output(program, args).await?;
 
@@ -458,5 +491,30 @@ mod tests {
         ] {
             assert!(StorePath::new(path).is_err(), "accepted {path}");
         }
+    }
+
+    #[test]
+    fn parses_requested_build_outputs() {
+        let output = r#"[{"drvPath":"/nix/store/00000000000000000000000000000000-git.drv","outputs":{"debug":"/nix/store/11111111111111111111111111111111-git-debug","doc":"/nix/store/22222222222222222222222222222222-git-doc","out":"/nix/store/33333333333333333333333333333333-git"}}]"#;
+        let paths = parse_build_plan_outputs(output).unwrap();
+        assert_eq!(
+            paths.iter().map(StorePath::as_str).collect::<Vec<_>>(),
+            [
+                "/nix/store/11111111111111111111111111111111-git-debug",
+                "/nix/store/22222222222222222222222222222222-git-doc",
+                "/nix/store/33333333333333333333333333333333-git",
+            ]
+        );
+    }
+
+    #[test]
+    fn detects_signature_or_trust_errors() {
+        assert!(is_signature_or_trust_error(
+            "cannot add path because it lacks a signature by a trusted key"
+        ));
+        assert!(is_signature_or_trust_error(
+            "unknown public key in trusted-public-keys"
+        ));
+        assert!(!is_signature_or_trust_error("HTTP error 404"));
     }
 }
