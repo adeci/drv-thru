@@ -53,6 +53,7 @@ pub async fn build(
     auth: BuildAuth,
     key_file: Option<PathBuf>,
     output_mode: OutputMode,
+    nar_fetches: Option<usize>,
 ) -> Result<()> {
     let mut status = ClientStatus::new();
     let installable_label = installable.clone();
@@ -184,6 +185,7 @@ pub async fn build(
         &mut status,
         &builder_public_key,
         &output_closure,
+        nar_fetches,
     )
     .await?;
 

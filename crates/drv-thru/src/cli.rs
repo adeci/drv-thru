@@ -54,6 +54,11 @@ enum Command {
         key_file: Option<PathBuf>,
         #[arg(long)]
         no_nom: bool,
+        #[arg(
+            long,
+            help = "Parallel NAR payload fetches for local cache mirroring. Defaults to auto; DRV_THRU_NAR_FETCHES is also honored."
+        )]
+        nar_fetches: Option<usize>,
     },
     Ticket {
         #[command(subcommand)]
@@ -151,14 +156,18 @@ pub async fn run() -> Result<()> {
             ticket,
             key_file,
             no_nom,
+            nar_fetches,
         } => {
             let output_mode = if no_nom {
                 OutputMode::Plain
             } else {
                 OutputMode::Nom
             };
+            if nar_fetches == Some(0) {
+                bail!("--nar-fetches must be at least 1");
+            }
             let auth = build_auth(server, relay_url, ticket)?;
-            client::build(installable, auth, key_file, output_mode).await
+            client::build(installable, auth, key_file, output_mode, nar_fetches).await
         }
         Command::Ticket { command } => match command {
             TicketCommand::Create {

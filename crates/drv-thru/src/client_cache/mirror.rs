@@ -50,6 +50,7 @@ pub(super) async fn build(
     closure_paths: &[nix::StorePath],
     copy_paths: &[nix::StorePath],
     progress: CacheProgress,
+    nar_fetches: Option<usize>,
 ) -> Result<LocalCacheMirror> {
     let dir = create_local_cache_dir()?;
     write_nix_cache_info(&dir).await?;
@@ -58,9 +59,16 @@ pub(super) async fn build(
         .iter()
         .map(narinfo_path_for_store_path)
         .collect::<BTreeSet<_>>();
-    mirror_cache_files(&conn, &dir, closure_paths, &copy_narinfos, progress)
-        .await
-        .with_context(|| format!("mirror cache files into {}", dir.display()))?;
+    mirror_cache_files(
+        &conn,
+        &dir,
+        closure_paths,
+        &copy_narinfos,
+        progress,
+        nar_fetches,
+    )
+    .await
+    .with_context(|| format!("mirror cache files into {}", dir.display()))?;
 
     Ok(LocalCacheMirror { dir })
 }
@@ -71,9 +79,10 @@ async fn mirror_cache_files(
     closure_paths: &[nix::StorePath],
     copy_narinfos: &BTreeSet<String>,
     progress: CacheProgress,
+    nar_fetches: Option<usize>,
 ) -> Result<()> {
     let metadata_permits = std::sync::Arc::new(Semaphore::new(MAX_PARALLEL_METADATA_FETCHES));
-    let payload_permits = std::sync::Arc::new(Semaphore::new(parallel_nar_fetches()?));
+    let payload_permits = std::sync::Arc::new(Semaphore::new(parallel_nar_fetches(nar_fetches)?));
     let mut metadata_tasks = JoinSet::new();
     let mut payload_tasks = JoinSet::new();
 
@@ -229,7 +238,11 @@ async fn write_nix_cache_info(dir: &Path) -> Result<()> {
     write_cache_bytes(dir, "nix-cache-info", b"StoreDir: /nix/store\n").await
 }
 
-fn parallel_nar_fetches() -> Result<usize> {
+fn parallel_nar_fetches(configured: Option<usize>) -> Result<usize> {
+    if let Some(configured) = configured {
+        return Ok(configured);
+    }
+
     if let Ok(value) = std::env::var(NAR_FETCHES_ENV) {
         let parsed = value
             .parse::<usize>()
@@ -240,10 +253,15 @@ fn parallel_nar_fetches() -> Result<usize> {
         return Ok(parsed);
     }
 
-    Ok(std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(DEFAULT_PARALLEL_NAR_FETCHES)
-        .clamp(DEFAULT_PARALLEL_NAR_FETCHES, MAX_AUTO_PARALLEL_NAR_FETCHES))
+    Ok(auto_parallel_nar_fetches(
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(DEFAULT_PARALLEL_NAR_FETCHES),
+    ))
+}
+
+fn auto_parallel_nar_fetches(available: usize) -> usize {
+    available.clamp(DEFAULT_PARALLEL_NAR_FETCHES, MAX_AUTO_PARALLEL_NAR_FETCHES)
 }
 
 fn create_local_cache_dir() -> Result<PathBuf> {
@@ -271,6 +289,16 @@ fn store_path_hash(path: &nix::StorePath) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_parallel_nar_fetches_clamps_to_sane_bounds() {
+        assert_eq!(auto_parallel_nar_fetches(1), DEFAULT_PARALLEL_NAR_FETCHES);
+        assert_eq!(auto_parallel_nar_fetches(16), 16);
+        assert_eq!(
+            auto_parallel_nar_fetches(128),
+            MAX_AUTO_PARALLEL_NAR_FETCHES
+        );
+    }
 
     #[test]
     fn maps_store_path_to_narinfo_path() {

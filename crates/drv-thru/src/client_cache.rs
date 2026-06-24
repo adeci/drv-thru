@@ -40,6 +40,7 @@ pub(crate) async fn import_output_cache(
     status: &mut ClientStatus,
     builder_public_key: &str,
     output_closure: &[String],
+    nar_fetches: Option<usize>,
 ) -> Result<u64> {
     status.phase("waiting for signed output cache");
     match wire::read_json::<Message>(recv).await? {
@@ -50,6 +51,7 @@ pub(crate) async fn import_output_cache(
                 status,
                 builder_public_key,
                 output_closure,
+                nar_fetches,
             )
             .await;
             let done_result = wire::write_json(send, &Message::OutputCacheDone).await;
@@ -88,6 +90,7 @@ async fn import_outputs_from_cache(
     status: &mut ClientStatus,
     builder_public_key: &str,
     output_closure: &[String],
+    nar_fetches: Option<usize>,
 ) -> Result<u64> {
     let copy_paths = cache
         .copy_paths
@@ -105,7 +108,14 @@ async fn import_outputs_from_cache(
     let progress = status.transfer("mirroring signed output cache");
     let cache_progress =
         CacheProgress::new(progress.clone(), closure_paths.len(), copy_paths.len());
-    let mirror = mirror::build(conn, &closure_paths, &copy_paths, cache_progress).await?;
+    let mirror = mirror::build(
+        conn,
+        &closure_paths,
+        &copy_paths,
+        cache_progress,
+        nar_fetches,
+    )
+    .await?;
     let local_cache = LocalCacheServer::start(mirror.dir().to_path_buf()).await?;
 
     let copy_result = match import_method {

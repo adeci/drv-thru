@@ -13,6 +13,12 @@ use std::{
 use indicatif::HumanBytes;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+const RESET: &str = "\x1b[0m";
+const DIM: &str = "\x1b[2m";
+const CYAN_BOLD: &str = "\x1b[1;36m";
+const GREEN_BOLD: &str = "\x1b[1;32m";
+const YELLOW_BOLD: &str = "\x1b[1;33m";
+
 pub struct ClientStatus {
     inner: Arc<Mutex<StatusLine>>,
     stop_ticker: Arc<AtomicBool>,
@@ -84,6 +90,7 @@ impl Drop for ClientStatus {
 
 struct StatusLine {
     interactive: bool,
+    color: bool,
     visible: bool,
     current: Option<Status>,
     last_draw: Instant,
@@ -93,6 +100,7 @@ impl StatusLine {
     fn new(interactive: bool) -> Self {
         Self {
             interactive,
+            color: interactive && std::env::var_os("NO_COLOR").is_none(),
             visible: false,
             current: None,
             last_draw: Instant::now(),
@@ -161,7 +169,7 @@ impl StatusLine {
         let Some(current) = &self.current else {
             return;
         };
-        eprint!("\r{}", fit_line(current.render()));
+        eprint!("\r{}", fit_line(current.render(self.color)));
         let _ = io::stderr().flush();
         self.visible = true;
         self.last_draw = Instant::now();
@@ -293,13 +301,15 @@ enum Status {
 }
 
 impl Status {
-    fn render(&self) -> String {
+    fn render(&self, color: bool) -> String {
         match self {
             Self::Phase { message, started } => {
-                format!(
-                    "drv-thru: {message} [{}]",
-                    format_elapsed(started.elapsed())
-                )
+                let elapsed = format_elapsed(started.elapsed());
+                if color {
+                    format!("{CYAN_BOLD}drv-thru{RESET}: {message} {DIM}[{elapsed}]{RESET}")
+                } else {
+                    format!("drv-thru: {message} [{elapsed}]")
+                }
             }
             Self::Transfer {
                 message,
@@ -309,12 +319,15 @@ impl Status {
                 let bytes = bytes.load(Ordering::Relaxed);
                 let elapsed = started.elapsed();
                 let rate = bytes / elapsed.as_secs().max(1);
-                format!(
-                    "drv-thru: {message}: {} ({}/s) {}",
-                    HumanBytes(bytes),
-                    HumanBytes(rate),
-                    format_elapsed(elapsed)
-                )
+                let bytes = HumanBytes(bytes);
+                let rate = HumanBytes(rate);
+                if color {
+                    format!(
+                        "{CYAN_BOLD}drv-thru{RESET}: {message}: {GREEN_BOLD}{bytes}{RESET} ({YELLOW_BOLD}{rate}/s{RESET})"
+                    )
+                } else {
+                    format!("drv-thru: {message}: {bytes} ({rate}/s)")
+                }
             }
         }
     }
@@ -327,11 +340,58 @@ fn fit_line(line: String) -> String {
         .unwrap_or(80)
         .saturating_sub(1);
 
-    if line.chars().count() <= columns {
+    if visible_width(&line) <= columns {
         return line;
     }
 
-    line.chars().take(columns).collect()
+    truncate_visible(&line, columns)
+}
+
+fn visible_width(line: &str) -> usize {
+    let mut chars = line.chars().peekable();
+    let mut width = 0;
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            for ch in chars.by_ref() {
+                if ch.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            width += 1;
+        }
+    }
+    width
+}
+
+fn truncate_visible(line: &str, columns: usize) -> String {
+    let mut out = String::new();
+    let mut chars = line.chars().peekable();
+    let mut width = 0;
+    let mut saw_escape = false;
+
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            saw_escape = true;
+            out.push(ch);
+            for ch in chars.by_ref() {
+                out.push(ch);
+                if ch.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else if width < columns {
+            out.push(ch);
+            width += 1;
+        } else {
+            break;
+        }
+    }
+
+    if saw_escape {
+        out.push_str(RESET);
+    }
+    out
 }
 
 fn format_elapsed(elapsed: Duration) -> String {
