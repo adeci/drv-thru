@@ -10,7 +10,6 @@ use std::{
 use anyhow::{Context, Result, bail};
 use iroh::SecretKey;
 
-#[derive(Clone)]
 pub struct SigningKey {
     pub secret_path: PathBuf,
     pub public_key: String,

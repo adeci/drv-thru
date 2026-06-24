@@ -2,6 +2,7 @@ mod access;
 mod cache;
 mod cli;
 mod client;
+mod client_cache;
 mod client_status;
 mod config;
 mod import_helper;

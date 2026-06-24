@@ -6,16 +6,20 @@
 
 Remote Nix builds over Iroh.
 
-Run `drv-thru` on a NixOS builder, give someone a ticket, and they can build on that machine. Missing inputs still upload as Nix export streams; requested outputs download through a persistent signed binary cache over Iroh. No SSH user setup or network shenanigans needed.
+Run `drv-thru` on a NixOS builder, hand someone a ticket, and they can run a build on that machine. Inputs the builder is missing upload as normal Nix export streams. Outputs come back through a signed binary cache served over Iroh. No SSH account on the builder.
 
-## Quick Start
+## Casual Setup
 
-On the builder, either enable the NixOS module:
+There are three common setups.
+
+### 1. Builder Machine
+
+Put this on the machine that will run builds.
 
 ```nix
-{ pkgs, inputs, ... }:
+{ inputs, pkgs, ... }:
 let
-  drvThru = inputs.drv-thru.packages.${pkgs.stdenv.hostPlatform.system}.drv-thru;
+  drvThru = inputs.drv-thru.packages.${pkgs.stdenv.hostPlatform.system}.default;
 in
 {
   imports = [ inputs.drv-thru.nixosModules.default ];
@@ -23,19 +27,18 @@ in
   services.drv-thru = {
     package = drvThru;
 
-    # Enable the builder daemon.
-    server.enable = true;
+    server = {
+      enable = true;
 
-    # Install the CLI for creating tickets on the builder.
-    client.enable = true;
+      # Optional long-lived clients. Tickets work without this.
+      trustedClients.alex = {
+        publicKey = "client-iroh-endpoint-id";
+        maxBuildTime = "30m";
+        maxUploadBytes = "20G";
+      };
+    };
   };
 }
-```
-
-Or run the package directly:
-
-```sh
-drv-thru serve
 ```
 
 Create a ticket on the builder:
@@ -44,23 +47,170 @@ Create a ticket on the builder:
 drv-thru ticket create
 ```
 
-Send that ticket to a client. They build with:
+Send the printed ticket to the client.
 
-```sh
-drv-thru build nixpkgs#hello --ticket "your-ticket-here"
+### 2. Regular Client For A Builder You Trust
+
+Use this when the client should always trust outputs signed by a specific builder.
+
+```nix
+{ inputs, pkgs, ... }:
+let
+  drvThru = inputs.drv-thru.packages.${pkgs.stdenv.hostPlatform.system}.default;
+in
+{
+  imports = [ inputs.drv-thru.nixosModules.default ];
+
+  services.drv-thru = {
+    package = drvThru;
+
+    client = {
+      enable = true;
+
+      trustedBuilders.leviathan = {
+        endpointId = "builder-iroh-endpoint-id";
+        publicKey = "drv-thru:builder-signing-public-key";
+        relayUrl = "https://use1-1.relay.n0.iroh.link./";
+      };
+    };
+  };
+}
 ```
 
-Or without installing:
+This adds the builder signing key to `nix.settings.trusted-public-keys`. After that, normal users on the client can import outputs signed by that builder.
+
+Build with trusted-client auth:
 
 ```sh
-nix run github:adeci/drv-thru#drv-thru -- build nixpkgs#hello --ticket "your-ticket-here"
+drv-thru key show
+# add the printed endpoint id to server.trustedClients on the builder
+
+drv-thru build nixpkgs#hello --server "builder-iroh-endpoint-id"
+```
+
+If node-id-only dialing does not have address info yet, pass the relay URL:
+
+```sh
+drv-thru build nixpkgs#hello \
+  --server "builder-iroh-endpoint-id" \
+  --relay-url "https://use1-1.relay.n0.iroh.link./"
+```
+
+### 3. Ticket-Only Client For One-Off Builders
+
+Use this when you want to test one-time tickets from arbitrary builders without making the local user a trusted Nix user and without saving builder keys in global Nix config.
+
+```nix
+{ inputs, pkgs, self, ... }:
+let
+  drvThru = inputs.drv-thru.packages.${pkgs.stdenv.hostPlatform.system}.default;
+in
+{
+  imports = [ inputs.drv-thru.nixosModules.default ];
+
+  services.drv-thru = {
+    package = drvThru;
+
+    client = {
+      enable = true;
+      ticketHelper.enable = true;
+    };
+  };
+
+  users.users.${self.users.alex.username}.extraGroups = [ "drv-thru" ];
+}
+```
+
+The helper is a local root service. Its socket is group-gated, so users who should use one-off tickets need to be in `drv-thru` or whatever group you set with `client.ticketHelper.group`.
+
+After changing groups, log out and back in.
+
+Then build with a ticket:
+
+```sh
+drv-thru build nixpkgs#hello --ticket "drvthru..."
+```
+
+No trusted builder entry is needed for this mode. The helper validates a narrow request and runs trusted `nix copy` locally for exact store paths from a loopback cache URL.
+
+## Usage
+
+Create a ticket with custom limits:
+
+```sh
+drv-thru ticket create \
+  --name friend \
+  --expires 2h \
+  --uses 1 \
+  --max-build-time 30m \
+  --max-upload-bytes 20G
 ```
 
 By default, tickets are one-use, expire after 2 hours, allow 30 minutes of build time, and allow 20 GiB of input upload.
 
-## NixOS Module
+Inspect a ticket:
 
-`package` is shared. `server` configures the builder daemon. `client` installs the CLI and declares builder cache keys this machine trusts for store imports.
+```sh
+drv-thru ticket inspect "drvthru..."
+```
+
+Build with a ticket:
+
+```sh
+drv-thru build nixpkgs#hello --ticket "drvthru..."
+```
+
+Use plain logs instead of local `nom` rendering:
+
+```sh
+drv-thru build nixpkgs#hello --ticket "drvthru..." --no-nom
+```
+
+Run without installing the package first:
+
+```sh
+nix run github:adeci/drv-thru#drv-thru -- build nixpkgs#hello --ticket "drvthru..."
+```
+
+## What Gets Trusted
+
+There are two separate trust decisions.
+
+- Builder access: who may spend CPU and disk on the builder?
+- Store import trust: whose binaries may enter the client's Nix store?
+
+Tickets and `server.trustedClients.*` answer the first question. Nix signing keys and the local import helper answer the second.
+
+A ticket alone does not make an untrusted multi-user Nix client accept outputs from a new builder. One of these must also be true:
+
+- the local user is a trusted Nix user,
+- the builder signing key is in `nix.settings.trusted-public-keys`, or
+- the local user can access the drv-thru import helper socket.
+
+## Output Cache
+
+Outputs are imported through Nix binary-cache semantics:
+
+- signed `.narinfo`
+- matching NAR/NAR.zst file
+- trusted public key, or a trusted local helper doing the import
+
+The server keeps a persistent signed cache under `/var/lib/drv-thru/cache`. Cache entries are generated on demand when the client asks for allowed `.narinfo` files, then reused across tickets and builds.
+
+Raw `nix-store --export` / `nix-store --import` is still used for server-side input upload. It is not used for client output import.
+
+## Limitations
+
+- Both sides still need Nix. drv-thru moves where the build happens; it is not a Nix daemon replacement.
+- One-off ticket builds for normal NixOS users need the local helper. Without it, Nix will reject unknown builder keys.
+- `client.trustedBuilders.*.endpointId` and `relayUrl` record builder dialing info, but builds still pass `--server`/`--relay-url` or `--ticket` today.
+- First request for a large uncached closure still has to generate cache entries. Later builds reuse the persistent cache.
+- The helper only accepts loopback HTTP cache URLs and exact `/nix/store/...` paths. It does not run arbitrary commands or arbitrary Nix options.
+- Tickets are bearer credentials. Whoever redeems a one-use ticket first gets the build.
+
+## NixOS Module Reference
+
+`package` is shared. `server` configures the builder daemon. `client` installs the CLI, trusted builder keys, and the optional local ticket helper.
 
 ```nix
 services.drv-thru = {
@@ -88,8 +238,6 @@ services.drv-thru = {
       relayUrl = null;
     };
 
-    # Optional: lets normal users in this group use one-off tickets
-    # from builders not already listed in trustedBuilders.
     ticketHelper = {
       enable = true;
       group = "drv-thru";
@@ -98,73 +246,4 @@ services.drv-thru = {
 };
 ```
 
-`client.trustedBuilders.*.publicKey` is appended to `nix.settings.trusted-public-keys`. `endpointId` and `relayUrl` record builder dialing info; builds still pass `--server`/`--relay-url` or `--ticket` today.
-
-The ticket helper is optional. Users in `client.ticketHelper.group` can import signed paths from ticket builders through a local root helper, so treat that group as local import trust.
-
-## Usage
-
-Create a ticket with custom limits:
-
-```sh
-drv-thru ticket create \
-  --name friend \
-  --expires 2h \
-  --uses 1 \
-  --max-build-time 30m \
-  --max-upload-bytes 20G
-```
-
-Inspect a ticket:
-
-```sh
-drv-thru ticket inspect "your-ticket-here"
-```
-
-Build with a ticket:
-
-```sh
-drv-thru build nixpkgs#hello --ticket "your-ticket-here"
-
-# no install needed
-nix run github:adeci/drv-thru#drv-thru -- build nixpkgs#hello --ticket "your-ticket-here"
-```
-
-Use plain logs instead of local `nom` rendering:
-
-```sh
-drv-thru build nixpkgs#hello --ticket "your-ticket-here" --no-nom
-```
-
-Trusted client access:
-
-```sh
-drv-thru key show
-```
-
-Add the printed endpoint id to the server allowlist, then build with:
-
-```sh
-drv-thru build nixpkgs#hello --server "server-endpoint-id"
-```
-
-If node-id-only dialing does not have address info yet, pass the relay URL printed by `serve`:
-
-```sh
-drv-thru build nixpkgs#hello \
-  --server "server-endpoint-id" \
-  --relay-url "https://use1-1.relay.n0.iroh.link./"
-```
-
-## Some Notes
-
-- Server build access means permission to run a Nix build on the server. Grant it with tickets or `server.trustedClients.*`.
-- Tickets are bearer credentials. Whoever redeems a one-use ticket first gets the build. Share them like passwords.
-- Trusted client keys are long-lived server access. Use them for machines or people the builder owner already trusts.
-- Client store import trust is separate: the client must run as root/a trusted Nix user, or the builder signing key must be in `nix.settings.trusted-public-keys`.
-- Tickets work for trusted Nix users, clients that already trust the builder key, or users allowed to use the client import helper. Treat that helper group as local import trust.
-- NixOS module state lives in `/var/lib/drv-thru`.
-- Wheel users can create/admin tickets; the server secret key stays private to the `drv-thru` service user.
-- Trusted-client builds use a persistent client key at `~/.config/drv-thru/secret.key`.
-- Ticket builds use ephemeral Iroh client keys by default.
-- Build logs render through local `nom --json` by default; use `--no-nom` for raw stderr logs.
+Module state lives in `/var/lib/drv-thru`. Wheel users can create and inspect tickets; the server Iroh secret key and signing secret key stay private to the `drv-thru` service user.

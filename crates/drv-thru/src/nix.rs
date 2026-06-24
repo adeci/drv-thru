@@ -294,9 +294,10 @@ pub async fn signed_cache_import_trust(public_key: &str) -> Result<SignedCacheIm
 
     bail!(
         "Nix will reject this signed cache import.\n\n\
-         This user is not a trusted Nix user, and the builder key is not in\n\
-         trusted-public-keys:\n\n  {public_key}\n\n\
-         Fix one of:\n  - add the builder key to nix.settings.trusted-public-keys\n  - run drv-thru as a trusted Nix user\n  - enable services.drv-thru.client.ticketHelper and add this user to its group"
+         Current user: {user}\n\
+         Builder key: {public_key}\n\n\
+         This user is not in nix.settings.trusted-users, and the builder key is not in nix.settings.trusted-public-keys.\n\n\
+         Fix one of:\n  - add this user to nix.settings.trusted-users\n  - add the builder key to nix.settings.trusted-public-keys\n  - enable services.drv-thru.client.ticketHelper and add this user to its group"
     );
 }
 

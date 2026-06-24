@@ -202,6 +202,19 @@ impl TicketStore {
         Ok(self.load()?.tickets.get(id).cloned())
     }
 
+    pub fn check(&self, secret: &[u8; 32], remote: &EndpointId) -> Result<TicketRecord> {
+        let _guard = self.lock.lock().expect("ticket store lock poisoned");
+        let _file_lock = self.lock_file()?;
+        let state = self.load_unlocked()?;
+        let id = ticket_id(secret);
+        let record = state
+            .tickets
+            .get(&id)
+            .with_context(|| format!("ticket not found: {id}"))?;
+        validate_ticket_record(&id, record, remote)?;
+        Ok(record.clone())
+    }
+
     pub fn redeem(&self, secret: &[u8; 32], remote: &EndpointId) -> Result<TicketRecord> {
         let _guard = self.lock.lock().expect("ticket store lock poisoned");
         let _file_lock = self.lock_file()?;
@@ -211,24 +224,9 @@ impl TicketStore {
             .tickets
             .get_mut(&id)
             .with_context(|| format!("ticket not found: {id}"))?;
-
-        if record.revoked {
-            bail!("ticket revoked");
-        }
-        if now_unix_secs()? >= record.expires_at_unix {
-            bail!("ticket expired");
-        }
-        if let Some(bound_client) = &record.bound_client {
-            let bound_client = bound_client
-                .parse::<EndpointId>()
-                .with_context(|| format!("parse bound client for ticket {id}"))?;
-            if &bound_client != remote {
-                bail!("ticket bound to a different client");
-            }
-        }
+        validate_ticket_record(&id, record, remote)?;
 
         match &mut record.uses_remaining {
-            Some(0) => bail!("ticket has no uses remaining"),
             Some(uses_remaining) => {
                 *uses_remaining -= 1;
                 let redeemed = record.clone();
@@ -277,6 +275,27 @@ impl Drop for TicketFileLock {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+fn validate_ticket_record(id: &str, record: &TicketRecord, remote: &EndpointId) -> Result<()> {
+    if record.revoked {
+        bail!("ticket revoked");
+    }
+    if now_unix_secs()? >= record.expires_at_unix {
+        bail!("ticket expired");
+    }
+    if let Some(bound_client) = &record.bound_client {
+        let bound_client = bound_client
+            .parse::<EndpointId>()
+            .with_context(|| format!("parse bound client for ticket {id}"))?;
+        if &bound_client != remote {
+            bail!("ticket bound to a different client");
+        }
+    }
+    if matches!(record.uses_remaining, Some(0)) {
+        bail!("ticket has no uses remaining");
+    }
+    Ok(())
 }
 
 fn ticket_store_lock_path(path: &Path) -> Result<PathBuf> {
@@ -519,6 +538,42 @@ mod tests {
         assert!(store.redeem(&ticket.secret(), &remote).is_err());
         assert_eq!(
             store.record(&ticket.id()).unwrap().unwrap().uses_remaining,
+            Some(0)
+        );
+
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn ticket_store_check_does_not_consume_use() {
+        let data_dir = temp_data_dir("check-does-not-consume");
+        let store = TicketStore::new(&data_dir);
+        let addr = EndpointAddr::new(SecretKey::generate().public());
+        let ticket = store
+            .create(
+                addr,
+                CreateTicket {
+                    name: Some("test".to_string()),
+                    expires_after: Duration::from_secs(60),
+                    uses_remaining: Some(1),
+                    max_build_time: "30m".to_string(),
+                    max_upload_bytes: "20G".to_string(),
+                },
+            )
+            .unwrap();
+        let remote = SecretKey::generate().public();
+
+        let checked = store.check(&ticket.secret(), &remote).unwrap();
+        assert_eq!(checked.uses_remaining, Some(1));
+        assert_eq!(
+            store.record(&ticket.id()).unwrap().unwrap().uses_remaining,
+            Some(1)
+        );
+        assert_eq!(
+            store
+                .redeem(&ticket.secret(), &remote)
+                .unwrap()
+                .uses_remaining,
             Some(0)
         );
 

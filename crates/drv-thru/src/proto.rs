@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-pub const ALPN: &[u8] = b"drv-thru/1";
-pub const VERSION: u32 = 1;
+pub const ALPN: &[u8] = b"drv-thru/2";
+pub const VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -50,6 +50,7 @@ impl std::fmt::Debug for AuthTicket {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AuthOk {
     pub client_name: Option<String>,
+    pub builder_public_key: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -80,7 +81,6 @@ pub struct BuildFinished {
 /// Signed binary-cache access; file bytes move on separate Iroh bi streams.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OutputCacheReady {
-    pub public_key: String,
     pub copy_paths: Vec<String>,
 }
 

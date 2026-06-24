@@ -18,7 +18,7 @@ const MAX_MESSAGE_LEN: usize = 1024 * 1024;
 const MAX_IMPORT_PATHS: usize = 8192;
 const MAX_ERROR_CHARS: usize = 16 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ImportRequest {
     pub builder_public_key: String,
     pub cache_url: String,
@@ -62,18 +62,47 @@ pub async fn serve(socket: PathBuf) -> Result<()> {
     }
 }
 
-pub fn helper_socket_exists(socket: &Path) -> bool {
-    std::fs::metadata(socket)
-        .map(|metadata| metadata.file_type().is_socket())
-        .unwrap_or(false)
+#[derive(Debug, PartialEq, Eq)]
+pub enum HelperSocketStatus {
+    Available,
+    Missing,
+    NotSocket,
+    Inaccessible(String),
+}
+
+pub fn helper_socket_status(socket: &Path) -> HelperSocketStatus {
+    match std::fs::metadata(socket) {
+        Ok(metadata) if metadata.file_type().is_socket() => HelperSocketStatus::Available,
+        Ok(_) => HelperSocketStatus::NotSocket,
+        Err(err) if err.kind() == ErrorKind::NotFound => HelperSocketStatus::Missing,
+        Err(err) => HelperSocketStatus::Inaccessible(err.to_string()),
+    }
 }
 
 pub async fn import_paths(socket: &Path, request: ImportRequest) -> Result<()> {
     validate_request(&request)?;
 
-    let mut stream = UnixStream::connect(socket)
-        .await
-        .with_context(|| format!("connect import helper socket {}", socket.display()))?;
+    let mut stream = match UnixStream::connect(socket).await {
+        Ok(stream) => stream,
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+            bail!(
+                "cannot connect to drv-thru import helper at {}: permission denied\n\n\
+                 Add this user to services.drv-thru.client.ticketHelper.group (default: drv-thru), rebuild, log out and back in, then retry.",
+                socket.display()
+            )
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            bail!(
+                "cannot connect to drv-thru import helper at {}: socket not found\n\n\
+                 Enable services.drv-thru.client.ticketHelper, rebuild, log out and back in, then retry.",
+                socket.display()
+            )
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("connect import helper socket {}", socket.display()));
+        }
+    };
     write_json(&mut stream, &request)
         .await
         .context("send import helper request")?;
