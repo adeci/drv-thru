@@ -4,7 +4,7 @@ use std::{
     io::ErrorKind,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -459,7 +459,14 @@ async fn export_outputs(
     output_paths: &[nix::StorePath],
     signing_key: &keys::SigningKey,
 ) -> Result<()> {
+    let closure_started = Instant::now();
     let closure = nix::output_closure(output_paths).await?;
+    println!(
+        "output closure: {} root path(s), {} closure path(s) in {:.1}s",
+        output_paths.len(),
+        closure.len(),
+        closure_started.elapsed().as_secs_f64()
+    );
     write_path_chunks(
         send,
         &store_paths_to_strings(&closure),
@@ -471,14 +478,29 @@ async fn export_outputs(
         read_path_chunks_with_timeout(recv, PathListKind::OutputRequest, CLIENT_NIX_TIMEOUT)
             .await
             .and_then(|request| requested_output_paths(request, &closure))?;
+    println!(
+        "output request: {} missing path(s) of {} closure path(s)",
+        requested.len(),
+        closure.len()
+    );
 
     if requested.is_empty() {
+        println!("output cache: skipped; client already has requested closure");
         return wire::write_json(send, &Message::Done).await;
     }
 
     let cache_dir = TempCacheDir::new()?;
+    let cache_started = Instant::now();
+    println!(
+        "output cache: creating signed zstd cache for {} path(s)",
+        requested.len()
+    );
     nix::copy_to_signed_binary_cache(&requested, cache_dir.path(), &signing_key.secret_path)
         .await?;
+    println!(
+        "output cache: ready in {:.1}s",
+        cache_started.elapsed().as_secs_f64()
+    );
 
     wire::write_json(
         send,
@@ -489,7 +511,13 @@ async fn export_outputs(
     )
     .await?;
 
+    let serve_started = Instant::now();
+    println!("output cache: serving files over Iroh");
     serve_output_cache(conn, recv, cache_dir.path()).await?;
+    println!(
+        "output cache: served in {:.1}s",
+        serve_started.elapsed().as_secs_f64()
+    );
     wire::write_json(send, &Message::Done).await
 }
 
@@ -552,6 +580,12 @@ async fn handle_cache_file_stream(
         .with_context(|| format!("stat {}", path.display()))?
         .len();
     write_cache_file_response(&mut send, true, byte_count).await?;
+    println!(
+        "output cache file: {} {} byte(s){}",
+        request.path,
+        byte_count,
+        if request.send_body { "" } else { " head" }
+    );
 
     if request.send_body {
         let mut body = file.take(byte_count);

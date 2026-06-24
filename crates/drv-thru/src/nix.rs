@@ -310,6 +310,7 @@ fn file_cache_url(cache_dir: &Path, secret_key: Option<&Path>) -> Result<String>
     if let Some(secret_key) = secret_key {
         url.push_str("?secret-key=");
         url.push_str(path_to_str(secret_key)?);
+        url.push_str("&compression=zstd&compression-level=1");
     }
     Ok(url)
 }

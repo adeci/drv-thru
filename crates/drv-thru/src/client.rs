@@ -359,7 +359,7 @@ async fn import_output_cache(
     recv: &mut RecvStream,
     status: &mut ClientStatus,
 ) -> Result<u64> {
-    status.phase("preparing output cache");
+    status.phase("waiting for signed output cache");
     match wire::read_json::<Message>(recv).await? {
         Message::OutputCacheReady(cache) => {
             let import_result = import_outputs_from_cache(conn.clone(), &cache, status).await;
