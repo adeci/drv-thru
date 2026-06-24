@@ -38,6 +38,7 @@ struct CheckedBuildRequest {
     drv_path: nix::StorePath,
     output_mode: OutputMode,
     closure_paths: Vec<nix::StorePath>,
+    output_paths: Vec<nix::StorePath>,
 }
 
 struct FinishedBuild {
@@ -311,6 +312,15 @@ fn handle_build_request(
     );
 
     let drv_path = nix::StorePath::new(request.drv_path)?;
+    let output_paths = request
+        .output_paths
+        .into_iter()
+        .map(nix::StorePath::new)
+        .collect::<Result<Vec<_>>>()?;
+    if output_paths.is_empty() {
+        bail!("build request did not include output paths");
+    }
+
     let mut closure_paths = closure_paths
         .into_iter()
         .map(nix::StorePath::new)
@@ -324,6 +334,7 @@ fn handle_build_request(
         drv_path,
         output_mode: request.output_mode,
         closure_paths,
+        output_paths,
     })
 }
 
@@ -358,6 +369,7 @@ async fn run_queued_build(
         &build.drv_path,
         build.output_mode,
         authorized.max_build_time,
+        &build.output_paths,
     )
     .await?;
     if finished.success {
@@ -372,6 +384,7 @@ async fn run_build(
     drv_path: &nix::StorePath,
     output_mode: OutputMode,
     max_build_time: Option<Duration>,
+    requested_outputs: &[nix::StorePath],
 ) -> Result<FinishedBuild> {
     wire::write_json(send, &Message::BuildStarted).await?;
 
@@ -384,8 +397,12 @@ async fn run_build(
         None => build.await?,
     };
     let success = result.success;
-    let output_paths = result
-        .output_paths
+    let output_paths = if success {
+        selected_outputs(requested_outputs, &result.output_paths)?
+    } else {
+        Vec::new()
+    };
+    let output_path_strings = output_paths
         .iter()
         .map(|path| path.as_str().to_string())
         .collect();
@@ -394,15 +411,33 @@ async fn run_build(
         &mut *log_sink.send,
         &Message::BuildFinished(BuildFinished {
             success,
-            output_paths,
+            output_paths: output_path_strings,
         }),
     )
     .await?;
 
     Ok(FinishedBuild {
         success,
-        output_paths: result.output_paths,
+        output_paths,
     })
+}
+
+fn selected_outputs(
+    requested_outputs: &[nix::StorePath],
+    all_outputs: &[nix::StorePath],
+) -> Result<Vec<nix::StorePath>> {
+    let all_outputs = all_outputs
+        .iter()
+        .map(|path| path.as_str().to_string())
+        .collect::<BTreeSet<_>>();
+    let mut selected = Vec::new();
+    for output in requested_outputs {
+        if !all_outputs.contains(output.as_str()) {
+            bail!("requested output was not realised: {}", output.as_str());
+        }
+        selected.push(output.clone());
+    }
+    Ok(selected)
 }
 
 async fn export_outputs(

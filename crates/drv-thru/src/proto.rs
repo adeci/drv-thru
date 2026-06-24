@@ -53,6 +53,7 @@ pub struct AuthOk {
 pub struct BuildRequest {
     pub installable: String,
     pub drv_path: String,
+    pub output_paths: Vec<String>,
     pub output_mode: OutputMode,
 }
 

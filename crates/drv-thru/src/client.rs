@@ -104,6 +104,11 @@ pub async fn build(
 
     status.phase("resolving derivation");
     let drv_path = nix::resolve_derivation(&installable_label).await?;
+    let requested_outputs = nix::resolve_outputs(&installable_label).await?;
+    let requested_output_strings = requested_outputs
+        .iter()
+        .map(|path| path.as_str().to_string())
+        .collect::<Vec<_>>();
 
     status.phase("checking closure");
     let closure_paths = nix::closure(&drv_path).await?;
@@ -118,6 +123,7 @@ pub async fn build(
         &Message::BuildRequest(BuildRequest {
             installable,
             drv_path: drv_path.as_str().to_string(),
+            output_paths: requested_output_strings,
             output_mode,
         }),
     )

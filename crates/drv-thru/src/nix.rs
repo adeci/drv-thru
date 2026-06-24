@@ -41,6 +41,15 @@ pub async fn resolve_derivation(installable: &str) -> Result<StorePath> {
     StorePath::new(path)
 }
 
+pub async fn resolve_outputs(installable: &str) -> Result<Vec<StorePath>> {
+    let output = run_command("nix", &["path-info", installable]).await?;
+    output
+        .lines()
+        .filter_map(non_empty_line)
+        .map(StorePath::new)
+        .collect()
+}
+
 pub async fn closure(path: &StorePath) -> Result<Vec<StorePath>> {
     query_closure(std::slice::from_ref(path)).await
 }
@@ -175,7 +184,7 @@ where
     R: AsyncRead + Unpin + ?Sized,
 {
     let mut child = Command::new("nix-store")
-        .arg("--import")
+        .args(["--option", "require-sigs", "false", "--import"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
