@@ -6,7 +6,7 @@
 
 Remote Nix builds over Iroh.
 
-Run `drv-thru` on a NixOS builder, give someone a ticket, and they can build on that machine. Missing inputs still upload as Nix export streams; requested outputs download through a signed binary cache over Iroh. No SSH user setup or network shenanigans needed.
+Run `drv-thru` on a NixOS builder, give someone a ticket, and they can build on that machine. Missing inputs still upload as Nix export streams; requested outputs download through a persistent signed binary cache over Iroh. No SSH user setup or network shenanigans needed.
 
 ## Quick Start
 

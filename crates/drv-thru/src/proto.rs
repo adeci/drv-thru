@@ -77,7 +77,7 @@ pub struct BuildFinished {
     pub output_paths: Vec<String>,
 }
 
-/// Temporary signed binary cache; file bytes move on separate Iroh bi streams.
+/// Signed binary-cache access; file bytes move on separate Iroh bi streams.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OutputCacheReady {
     pub public_key: String,

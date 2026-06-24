@@ -119,4 +119,12 @@ mod tests {
             assert!(sanitize_cache_path(path).is_err(), "accepted {path}");
         }
     }
+
+    #[test]
+    fn cache_file_path_rejects_traversal() {
+        let cache_dir = Path::new("/tmp/drv-thru-cache");
+
+        assert!(cache_file_path(cache_dir, "../nix-cache-info").is_err());
+        assert!(cache_file_path(cache_dir, "nar/../x.nar").is_err());
+    }
 }

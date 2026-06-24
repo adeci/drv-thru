@@ -177,6 +177,7 @@ in
 
       system.activationScripts.drv-thru-state = lib.stringAfter [ "users" ] ''
         install -d -o drv-thru -g wheel -m 2770 ${serverCfg.dataDir}
+        install -d -o drv-thru -g drv-thru -m 0750 ${serverCfg.dataDir}/cache
 
         if [ -e ${serverCfg.secretKeyFile} ]; then
           chown drv-thru:drv-thru ${serverCfg.secretKeyFile}
