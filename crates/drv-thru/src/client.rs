@@ -183,6 +183,7 @@ pub async fn build(
         &mut recv,
         &mut status,
         &builder_public_key,
+        &output_closure,
     )
     .await?;
 

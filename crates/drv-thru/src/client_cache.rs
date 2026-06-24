@@ -1,3 +1,6 @@
+mod local_server;
+mod mirror;
+
 use std::{
     collections::BTreeSet,
     path::Path,
@@ -9,21 +12,21 @@ use anyhow::{Context, Result, bail};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
-    sync::oneshot,
-    task::JoinSet,
+    net::TcpStream,
 };
 
 use crate::{
-    cache,
-    client_status::{ClientStatus, ProgressReader, TransferProgress},
+    client_status::{ClientStatus, TransferProgress},
     import_helper, nix,
     proto::{CacheFileRequest, CacheFileResponse, Message, OutputCacheReady},
     wire,
 };
 
+use self::local_server::LocalCacheServer;
+
 const CACHE_FILE_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const CACHE_FILE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
 
 pub(crate) async fn preflight_output_import(public_key: &str) -> Result<()> {
     let _ = output_import_method(public_key).await?;
@@ -36,12 +39,19 @@ pub(crate) async fn import_output_cache(
     recv: &mut RecvStream,
     status: &mut ClientStatus,
     builder_public_key: &str,
+    output_closure: &[String],
 ) -> Result<u64> {
     status.phase("waiting for signed output cache");
     match wire::read_json::<Message>(recv).await? {
         Message::OutputCacheReady(cache) => {
-            let import_result =
-                import_outputs_from_cache(conn.clone(), &cache, status, builder_public_key).await;
+            let import_result = import_outputs_from_cache(
+                conn.clone(),
+                &cache,
+                status,
+                builder_public_key,
+                output_closure,
+            )
+            .await;
             let done_result = wire::write_json(send, &Message::OutputCacheDone).await;
             let server_done_result = if done_result.is_ok() {
                 read_server_done(recv).await
@@ -77,6 +87,7 @@ async fn import_outputs_from_cache(
     cache: &OutputCacheReady,
     status: &mut ClientStatus,
     builder_public_key: &str,
+    output_closure: &[String],
 ) -> Result<u64> {
     let copy_paths = cache
         .copy_paths
@@ -84,17 +95,23 @@ async fn import_outputs_from_cache(
         .cloned()
         .map(nix::StorePath::new)
         .collect::<Result<Vec<_>>>()?;
+    let closure_paths = output_closure
+        .iter()
+        .cloned()
+        .map(nix::StorePath::new)
+        .collect::<Result<Vec<_>>>()?;
     status.phase("checking output import trust");
     let import_method = output_import_method(builder_public_key).await?;
-    let progress = status.transfer("preparing signed output cache");
+    let progress = status.transfer("mirroring signed output cache");
     let cache_progress =
-        CacheProgress::new(progress.clone(), cache.closure_path_count, copy_paths.len());
-    let bridge = CacheBridge::start(conn, cache_progress).await?;
+        CacheProgress::new(progress.clone(), closure_paths.len(), copy_paths.len());
+    let mirror = mirror::build(conn, &closure_paths, &copy_paths, cache_progress).await?;
+    let local_cache = LocalCacheServer::start(mirror.dir().to_path_buf()).await?;
 
     let copy_result = match import_method {
         OutputImportMethod::Direct(import_trust) => {
             nix::copy_from_signed_binary_cache(
-                bridge.url(),
+                local_cache.url(),
                 builder_public_key,
                 import_trust,
                 &copy_paths,
@@ -106,7 +123,7 @@ async fn import_outputs_from_cache(
                 Path::new(import_helper::DEFAULT_SOCKET_PATH),
                 import_helper::ImportRequest {
                     builder_public_key: builder_public_key.to_string(),
-                    cache_url: bridge.url().to_string(),
+                    cache_url: local_cache.url().to_string(),
                     paths: copy_paths
                         .iter()
                         .map(|path| path.as_str().to_string())
@@ -116,11 +133,12 @@ async fn import_outputs_from_cache(
             .await
         }
     };
-    let bridge_result = bridge.shutdown().await;
+    let server_result = local_cache.shutdown().await;
+    let mirror_result = mirror.cleanup().await;
     let bytes = progress.bytes();
     progress.finish_and_clear();
 
-    match (copy_result, bridge_result) {
+    match (copy_result, server_result.and(mirror_result)) {
         (Ok(()), Ok(())) => Ok(bytes),
         (Err(err), Ok(())) => Err(err),
         (Ok(()), Err(err)) => Err(err),
@@ -275,149 +293,6 @@ fn progress_count(done: usize, total: usize) -> String {
     } else {
         format!("{done}/{total}")
     }
-}
-
-struct CacheBridge {
-    url: String,
-    shutdown: Option<oneshot::Sender<()>>,
-    handle: tokio::task::JoinHandle<Result<()>>,
-}
-
-impl CacheBridge {
-    async fn start(conn: Connection, progress: CacheProgress) -> Result<Self> {
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .context("bind local cache bridge")?;
-        let url = format!("http://{}", listener.local_addr()?);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let handle = tokio::spawn(run_cache_bridge(listener, conn, progress, shutdown_rx));
-
-        Ok(Self {
-            url,
-            shutdown: Some(shutdown_tx),
-            handle,
-        })
-    }
-
-    fn url(&self) -> &str {
-        &self.url
-    }
-
-    async fn shutdown(mut self) -> Result<()> {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-        self.handle.await.context("cache bridge task panicked")?
-    }
-}
-
-async fn run_cache_bridge(
-    listener: TcpListener,
-    conn: Connection,
-    progress: CacheProgress,
-    mut shutdown: oneshot::Receiver<()>,
-) -> Result<()> {
-    let mut tasks = JoinSet::new();
-    let first_error = Arc::new(Mutex::new(None));
-    loop {
-        tokio::select! {
-            _ = &mut shutdown => break,
-            accepted = listener.accept() => {
-                let (stream, _) = accepted.context("accept local cache HTTP connection")?;
-                let conn = conn.clone();
-                let progress = progress.clone();
-                let first_error = first_error.clone();
-                tasks.spawn(async move {
-                    if let Err(err) = handle_cache_http(stream, conn, progress).await {
-                        let message = err.to_string();
-                        if let Ok(mut first_error) = first_error.lock()
-                            && first_error.is_none()
-                        {
-                            eprintln!("cache bridge request failed: {message}");
-                            *first_error = Some(message);
-                        }
-                    }
-                });
-            }
-            result = tasks.join_next(), if !tasks.is_empty() => {
-                if let Some(result) = result {
-                    result.context("cache HTTP task panicked")?;
-                }
-            }
-        }
-    }
-
-    while let Some(result) = tasks.join_next().await {
-        result.context("cache HTTP task panicked")?;
-    }
-    if let Ok(mut first_error) = first_error.lock()
-        && let Some(first_error) = first_error.take()
-    {
-        bail!("{first_error}");
-    }
-    Ok(())
-}
-
-async fn handle_cache_http(
-    mut stream: TcpStream,
-    conn: Connection,
-    progress: CacheProgress,
-) -> Result<()> {
-    let request = match read_http_request(&mut stream).await {
-        Ok(request) => request,
-        Err(err) => {
-            let _ = write_http_head(&mut stream, 400, 0).await;
-            return Err(err);
-        }
-    };
-
-    if !matches!(request.method, HttpMethod::Get | HttpMethod::Head) {
-        write_http_head(&mut stream, 405, 0).await?;
-        return Ok(());
-    }
-
-    let path = match cache::sanitize_http_cache_path(&request.target) {
-        Ok(path) => path,
-        Err(_) => {
-            write_http_head(&mut stream, 400, 0).await?;
-            return Ok(());
-        }
-    };
-
-    let send_body = matches!(request.method, HttpMethod::Get);
-    let fetched = match fetch_cache_file(&conn, &path, send_body).await {
-        Ok(fetched) => fetched,
-        Err(err) => {
-            let _ = write_http_error(
-                &mut stream,
-                502,
-                &format!("cache fetch failed: {path}: {err:#}\n"),
-            )
-            .await;
-            return Err(err).with_context(|| format!("cache bridge returned 502 for {path}"));
-        }
-    };
-
-    let Some(mut fetched) = fetched else {
-        write_http_error(&mut stream, 404, &format!("cache file not found: {path}\n")).await?;
-        bail!("cache bridge returned 404 for {path}");
-    };
-
-    if !send_body || !path.starts_with("nar/") {
-        progress.record_cache_file(&path, send_body);
-    }
-    write_http_head(&mut stream, 200, fetched.byte_count).await?;
-    if let Some(body) = fetched.body.take() {
-        let mut body = ProgressReader::new(body.take(fetched.byte_count), progress.transfer());
-        let copied = tokio::io::copy(&mut body, &mut stream)
-            .await
-            .context("stream cache body to local Nix")?;
-        if copied != fetched.byte_count {
-            bail!("short cache body: {copied} of {} bytes", fetched.byte_count);
-        }
-        progress.record_cache_file(&path, send_body);
-    }
-    Ok(())
 }
 
 struct HttpRequest {

@@ -197,7 +197,7 @@ async fn handle_cache_file_stream(
         let bytes = tokio::fs::read(&file_path)
             .await
             .with_context(|| format!("read {}", file_path.display()))?;
-        if let Some(nar_path) = narinfo_nar_path(&bytes)? {
+        if let Some(nar_path) = cache::narinfo_nar_path(&bytes)? {
             access.allowed_nar_paths.lock().await.insert(nar_path);
         }
         stream_cache_bytes(&mut send, &path, &bytes, request.send_body).await?;
@@ -407,7 +407,7 @@ async fn cache_entry_ready(cache: &OutputCache, narinfo_path: &Path) -> Result<b
         return Ok(false);
     }
 
-    let Some(nar_path) = narinfo_nar_path(&bytes)? else {
+    let Some(nar_path) = cache::narinfo_nar_path(&bytes)? else {
         return Ok(false);
     };
     let nar_path = cache::cache_file_path(&cache.dir, &nar_path)?;
@@ -448,21 +448,6 @@ fn map_narinfo_to_allowed_store_path<'a>(
         bail!("invalid narinfo path: {path}");
     }
     Ok(allowed.get(hash))
-}
-
-fn narinfo_nar_path(bytes: &[u8]) -> Result<Option<String>> {
-    let text = std::str::from_utf8(bytes).context("narinfo is not UTF-8")?;
-    for line in text.lines() {
-        let Some(url) = line.strip_prefix("URL:") else {
-            continue;
-        };
-        let path = cache::sanitize_cache_path(url.trim())?;
-        if !path.starts_with("nar/") {
-            bail!("narinfo URL is not a NAR path: {path}");
-        }
-        return Ok(Some(path));
-    }
-    Ok(None)
 }
 
 fn signing_cache_dir_name(public_key: &str) -> String {
@@ -545,24 +530,6 @@ mod tests {
                 .unwrap();
 
         assert_eq!(mapped.as_str(), store_path.as_str());
-    }
-
-    #[test]
-    fn extracts_nar_path_from_narinfo() {
-        let narinfo = b"StorePath: /nix/store/00000000000000000000000000000000-hello
-URL: nar/abc.nar.zst
-";
-        assert_eq!(
-            narinfo_nar_path(narinfo).unwrap().unwrap(),
-            "nar/abc.nar.zst"
-        );
-    }
-
-    #[test]
-    fn rejects_bad_narinfo_url() {
-        let narinfo = b"URL: ../abc.nar.zst
-";
-        assert!(narinfo_nar_path(narinfo).is_err());
     }
 
     #[test]

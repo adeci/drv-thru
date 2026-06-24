@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 const NIX_BASE32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
 
@@ -41,6 +41,21 @@ pub fn sanitize_cache_path(path: &str) -> Result<String> {
 pub fn cache_file_path(cache_dir: &Path, path: &str) -> Result<PathBuf> {
     let path = sanitize_cache_path(path)?;
     Ok(cache_dir.join(path))
+}
+
+pub fn narinfo_nar_path(bytes: &[u8]) -> Result<Option<String>> {
+    let text = std::str::from_utf8(bytes).context("narinfo is not UTF-8")?;
+    for line in text.lines() {
+        let Some(url) = line.strip_prefix("URL:") else {
+            continue;
+        };
+        let path = sanitize_cache_path(url.trim())?;
+        if !path.starts_with("nar/") {
+            bail!("narinfo URL is not a NAR path: {path}");
+        }
+        return Ok(Some(path));
+    }
+    Ok(None)
 }
 
 fn valid_narinfo_stem(stem: &str) -> bool {
@@ -118,6 +133,24 @@ mod tests {
         ] {
             assert!(sanitize_cache_path(path).is_err(), "accepted {path}");
         }
+    }
+
+    #[test]
+    fn extracts_nar_path_from_narinfo() {
+        let narinfo = b"StorePath: /nix/store/00000000000000000000000000000000-hello
+URL: nar/abc.nar.zst
+";
+        assert_eq!(
+            narinfo_nar_path(narinfo).unwrap().unwrap(),
+            "nar/abc.nar.zst"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_narinfo_url() {
+        let narinfo = b"URL: ../abc.nar.zst
+";
+        assert!(narinfo_nar_path(narinfo).is_err());
     }
 
     #[test]
