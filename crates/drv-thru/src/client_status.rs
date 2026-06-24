@@ -121,8 +121,14 @@ impl StatusLine {
             message: current, ..
         }) = &mut self.current
         {
-            *current = message.into();
-            self.draw_now();
+            let message = message.into();
+            if *current == message {
+                return;
+            }
+            *current = message;
+            if self.last_draw.elapsed() >= Duration::from_millis(100) {
+                self.draw_now();
+            }
         }
     }
 

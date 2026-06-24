@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-pub const ALPN: &[u8] = b"drv-thru/2";
-pub const VERSION: u32 = 2;
+pub const ALPN: &[u8] = b"drv-thru/3";
+pub const VERSION: u32 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -82,6 +82,7 @@ pub struct BuildFinished {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OutputCacheReady {
     pub copy_paths: Vec<String>,
+    pub closure_path_count: usize,
 }
 
 /// Request for one sanitized binary-cache file path.

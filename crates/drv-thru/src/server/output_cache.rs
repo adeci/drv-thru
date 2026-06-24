@@ -101,6 +101,7 @@ pub(super) async fn export_outputs(
         send,
         &Message::OutputCacheReady(OutputCacheReady {
             copy_paths: store_paths_to_strings(&requested),
+            closure_path_count: closure.len(),
         }),
     )
     .await?;

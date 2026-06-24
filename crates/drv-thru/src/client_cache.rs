@@ -1,11 +1,11 @@
 use std::{
+    collections::BTreeSet,
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
-use indicatif::HumanBytes;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -86,13 +86,10 @@ async fn import_outputs_from_cache(
         .collect::<Result<Vec<_>>>()?;
     status.phase("checking output import trust");
     let import_method = output_import_method(builder_public_key).await?;
-    let message = format!(
-        "preparing signed cache for {} {}",
-        copy_paths.len(),
-        path_word(copy_paths.len())
-    );
-    let progress = status.transfer(message);
-    let bridge = CacheBridge::start(conn, progress.clone()).await?;
+    let progress = status.transfer("preparing signed output cache");
+    let cache_progress =
+        CacheProgress::new(progress.clone(), cache.closure_path_count, copy_paths.len());
+    let bridge = CacheBridge::start(conn, cache_progress).await?;
 
     let copy_result = match import_method {
         OutputImportMethod::Direct(import_trust) => {
@@ -217,6 +214,69 @@ fn cache_bridge_status_error(err: &anyhow::Error) -> bool {
     })
 }
 
+#[derive(Clone)]
+struct CacheProgress {
+    transfer: TransferProgress,
+    state: Arc<Mutex<CacheProgressState>>,
+}
+
+struct CacheProgressState {
+    metadata_seen: BTreeSet<String>,
+    payload_seen: BTreeSet<String>,
+    metadata_total: usize,
+    payload_total: usize,
+}
+
+impl CacheProgress {
+    fn new(transfer: TransferProgress, metadata_total: usize, payload_total: usize) -> Self {
+        let progress = Self {
+            transfer,
+            state: Arc::new(Mutex::new(CacheProgressState {
+                metadata_seen: BTreeSet::new(),
+                payload_seen: BTreeSet::new(),
+                metadata_total,
+                payload_total,
+            })),
+        };
+        progress.refresh();
+        progress
+    }
+
+    fn transfer(&self) -> TransferProgress {
+        self.transfer.clone()
+    }
+
+    fn record_cache_file(&self, path: &str, send_body: bool) {
+        if let Ok(mut state) = self.state.lock() {
+            if path.ends_with(".narinfo") {
+                state.metadata_seen.insert(path.to_string());
+            } else if send_body && path.starts_with("nar/") {
+                state.payload_seen.insert(path.to_string());
+            }
+        }
+        self.refresh();
+    }
+
+    fn refresh(&self) {
+        let Ok(state) = self.state.lock() else {
+            return;
+        };
+        self.transfer.message(format!(
+            "cache metadata {}, payloads {}",
+            progress_count(state.metadata_seen.len(), state.metadata_total),
+            progress_count(state.payload_seen.len(), state.payload_total)
+        ));
+    }
+}
+
+fn progress_count(done: usize, total: usize) -> String {
+    if total == 0 {
+        done.to_string()
+    } else {
+        format!("{done}/{total}")
+    }
+}
+
 struct CacheBridge {
     url: String,
     shutdown: Option<oneshot::Sender<()>>,
@@ -224,7 +284,7 @@ struct CacheBridge {
 }
 
 impl CacheBridge {
-    async fn start(conn: Connection, progress: TransferProgress) -> Result<Self> {
+    async fn start(conn: Connection, progress: CacheProgress) -> Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .context("bind local cache bridge")?;
@@ -254,7 +314,7 @@ impl CacheBridge {
 async fn run_cache_bridge(
     listener: TcpListener,
     conn: Connection,
-    progress: TransferProgress,
+    progress: CacheProgress,
     mut shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
     let mut tasks = JoinSet::new();
@@ -301,7 +361,7 @@ async fn run_cache_bridge(
 async fn handle_cache_http(
     mut stream: TcpStream,
     conn: Connection,
-    progress: TransferProgress,
+    progress: CacheProgress,
 ) -> Result<()> {
     let request = match read_http_request(&mut stream).await {
         Ok(request) => request,
@@ -325,10 +385,6 @@ async fn handle_cache_http(
     };
 
     let send_body = matches!(request.method, HttpMethod::Get);
-    progress.message(format!(
-        "preparing signed cache {}",
-        cache_status_path(&path)
-    ));
     let fetched = match fetch_cache_file(&conn, &path, send_body).await {
         Ok(fetched) => fetched,
         Err(err) => {
@@ -343,21 +399,23 @@ async fn handle_cache_http(
     };
 
     let Some(mut fetched) = fetched else {
-        progress.message(format!("cache miss {}", cache_status_path(&path)));
         write_http_error(&mut stream, 404, &format!("cache file not found: {path}\n")).await?;
         bail!("cache bridge returned 404 for {path}");
     };
 
-    progress.message(cache_transfer_message(&path, send_body, fetched.byte_count));
+    if !send_body || !path.starts_with("nar/") {
+        progress.record_cache_file(&path, send_body);
+    }
     write_http_head(&mut stream, 200, fetched.byte_count).await?;
     if let Some(body) = fetched.body.take() {
-        let mut body = ProgressReader::new(body.take(fetched.byte_count), progress);
+        let mut body = ProgressReader::new(body.take(fetched.byte_count), progress.transfer());
         let copied = tokio::io::copy(&mut body, &mut stream)
             .await
             .context("stream cache body to local Nix")?;
         if copied != fetched.byte_count {
             bail!("short cache body: {copied} of {} bytes", fetched.byte_count);
         }
+        progress.record_cache_file(&path, send_body);
     }
     Ok(())
 }
@@ -372,39 +430,6 @@ enum HttpMethod {
     Get,
     Head,
     Other,
-}
-
-fn cache_transfer_message(path: &str, send_body: bool, byte_count: u64) -> String {
-    if send_body {
-        format!(
-            "recv {} {}",
-            cache_status_path(path),
-            HumanBytes(byte_count)
-        )
-    } else {
-        format!(
-            "cache metadata {} {} head",
-            cache_status_path(path),
-            HumanBytes(byte_count)
-        )
-    }
-}
-
-fn cache_status_path(path: &str) -> String {
-    if path.len() <= 72 {
-        return path.to_string();
-    }
-
-    let start = path.chars().take(40).collect::<String>();
-    let end = path
-        .chars()
-        .rev()
-        .take(24)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>();
-    format!("{start}...{end}")
 }
 
 struct FetchedCacheFile {
@@ -519,10 +544,6 @@ async fn write_http_error(stream: &mut TcpStream, code: u16, message: &str) -> R
         .write_all(message.as_bytes())
         .await
         .context("write HTTP error body")
-}
-
-fn path_word(count: usize) -> &'static str {
-    if count == 1 { "path" } else { "paths" }
 }
 
 #[cfg(test)]
