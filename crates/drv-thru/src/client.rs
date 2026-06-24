@@ -404,12 +404,18 @@ async fn import_outputs_from_cache(
         .cloned()
         .map(nix::StorePath::new)
         .collect::<Result<Vec<_>>>()?;
+    let import_trust = nix::signed_cache_import_trust(&cache.public_key).await?;
     let message = format!("recv {} {}", copy_paths.len(), path_word(copy_paths.len()));
     let progress = status.transfer(message);
     let bridge = CacheBridge::start(conn, progress.clone()).await?;
 
-    let copy_result =
-        nix::copy_from_signed_binary_cache(bridge.url(), &cache.public_key, &copy_paths).await;
+    let copy_result = nix::copy_from_signed_binary_cache(
+        bridge.url(),
+        &cache.public_key,
+        import_trust,
+        &copy_paths,
+    )
+    .await;
     let bridge_result = bridge.shutdown().await;
     let bytes = progress.bytes();
     progress.finish_and_clear();

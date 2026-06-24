@@ -264,9 +264,46 @@ pub async fn copy_to_signed_binary_cache(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+pub enum SignedCacheImportTrust {
+    CanPassPublicKey,
+    KeyAlreadyTrusted,
+}
+
+pub async fn signed_cache_import_trust(public_key: &str) -> Result<SignedCacheImportTrust> {
+    let public_key = public_key.trim();
+    if public_key.is_empty() {
+        bail!("trusted public key is empty");
+    }
+
+    if current_uid_is_root().await? {
+        return Ok(SignedCacheImportTrust::CanPassPublicKey);
+    }
+
+    let user = current_user_name().await?;
+    let groups = current_group_names().await?;
+    let trusted_users = nix_config_values("trusted-users").await?;
+    if trusted_users_allow_user(&trusted_users, &user, &groups) {
+        return Ok(SignedCacheImportTrust::CanPassPublicKey);
+    }
+
+    let trusted_public_keys = nix_config_values("trusted-public-keys").await?;
+    if trusted_public_keys.contains(public_key) {
+        return Ok(SignedCacheImportTrust::KeyAlreadyTrusted);
+    }
+
+    bail!(
+        "Nix will reject this signed cache import.\n\n\
+         This user is not a trusted Nix user, and the builder key is not in\n\
+         trusted-public-keys:\n\n  {public_key}\n\n\
+         Fix one of:\n  - add the builder key to nix.settings.trusted-public-keys\n  - run drv-thru as a trusted Nix user\n  - install the drv-thru client helper (planned)"
+    );
+}
+
 pub async fn copy_from_signed_binary_cache(
     cache_url: &str,
     public_key: &str,
+    trust: SignedCacheImportTrust,
     paths: &[StorePath],
 ) -> Result<()> {
     if paths.is_empty() {
@@ -283,13 +320,17 @@ pub async fn copy_from_signed_binary_cache(
             "copy".to_string(),
             "--from".to_string(),
             cache_url.to_string(),
-            "--option".to_string(),
-            "require-sigs".to_string(),
-            "true".to_string(),
-            "--option".to_string(),
-            "trusted-public-keys".to_string(),
-            public_key.to_string(),
         ];
+        if matches!(trust, SignedCacheImportTrust::CanPassPublicKey) {
+            args.extend([
+                "--option".to_string(),
+                "require-sigs".to_string(),
+                "true".to_string(),
+                "--option".to_string(),
+                "trusted-public-keys".to_string(),
+                public_key.to_string(),
+            ]);
+        }
         args.extend(chunk.iter().map(|path| path.as_str().to_string()));
         if let Err(err) = run_nix_command(args, "nix copy from signed binary cache").await {
             let message = err.to_string();
@@ -302,6 +343,98 @@ pub async fn copy_from_signed_binary_cache(
         }
     }
     Ok(())
+}
+
+async fn current_uid_is_root() -> Result<bool> {
+    let uid = run_command("id", &["-u"])
+        .await
+        .context("read current uid")?;
+    Ok(uid.trim() == "0")
+}
+
+async fn current_user_name() -> Result<String> {
+    let user = run_command("id", &["-un"])
+        .await
+        .context("read current user")?;
+    let user = user.trim();
+    if user.is_empty() {
+        bail!("current user name is empty");
+    }
+    Ok(user.to_string())
+}
+
+async fn current_group_names() -> Result<BTreeSet<String>> {
+    let groups = run_command("id", &["-Gn"])
+        .await
+        .context("read current groups")?;
+    Ok(groups
+        .split_whitespace()
+        .map(|group| group.to_string())
+        .collect())
+}
+
+async fn nix_config_values(option: &str) -> Result<BTreeSet<String>> {
+    let output = run_command("nix", &["config", "show", option])
+        .await
+        .with_context(|| format!("read nix config {option}"))?;
+    Ok(parse_nix_config_values(&output, option))
+}
+
+fn parse_nix_config_values(output: &str, option: &str) -> BTreeSet<String> {
+    let mut values = BTreeSet::new();
+    let mut bare_lines = Vec::new();
+    let mut saw_assignment = false;
+    let mut saw_matching_assignment = false;
+
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if let Some((key, value)) = line.split_once('=') {
+            saw_assignment = true;
+            if key.trim() == option {
+                saw_matching_assignment = true;
+                values.extend(value.split_whitespace().map(ToString::to_string));
+            }
+        } else {
+            bare_lines.push(line);
+        }
+    }
+
+    if !saw_assignment || !saw_matching_assignment {
+        for line in bare_lines {
+            values.extend(line.split_whitespace().map(ToString::to_string));
+        }
+    }
+
+    values
+}
+
+fn trusted_users_allow_user(
+    trusted_users: &BTreeSet<String>,
+    user: &str,
+    groups: &BTreeSet<String>,
+) -> bool {
+    trusted_users.contains("*")
+        || trusted_users.contains(user)
+        || groups
+            .iter()
+            .any(|group| trusted_users.contains(&format!("@{group}")))
+}
+
+#[cfg(test)]
+fn signed_cache_import_allowed(
+    is_root: bool,
+    current_user: &str,
+    current_groups: &BTreeSet<String>,
+    trusted_users: &BTreeSet<String>,
+    trusted_public_keys: &BTreeSet<String>,
+    public_key: &str,
+) -> bool {
+    is_root
+        || trusted_users_allow_user(trusted_users, current_user, current_groups)
+        || trusted_public_keys.contains(public_key.trim())
 }
 
 fn file_cache_url(cache_dir: &Path, secret_key: Option<&Path>) -> Result<String> {
@@ -506,6 +639,96 @@ mod tests {
                 "/nix/store/33333333333333333333333333333333-git",
             ]
         );
+    }
+
+    #[test]
+    fn parses_trusted_users_config() {
+        assert_eq!(
+            parse_nix_config_values("trusted-users = root alex @wheel", "trusted-users"),
+            set(&["root", "alex", "@wheel"])
+        );
+        assert_eq!(
+            parse_nix_config_values("root *", "trusted-users"),
+            set(&["root", "*"])
+        );
+    }
+
+    #[test]
+    fn detects_trusted_public_key_config() {
+        let keys = parse_nix_config_values(
+            "trusted-public-keys = cache.nixos.org-1:abc drv-thru:builder-key",
+            "trusted-public-keys",
+        );
+
+        assert!(keys.contains("drv-thru:builder-key"));
+        assert!(!keys.contains("drv-thru:other-key"));
+    }
+
+    #[test]
+    fn accepts_root_or_trusted_user_for_signed_cache_import() {
+        let empty = BTreeSet::new();
+        assert!(signed_cache_import_allowed(
+            true,
+            "nobody",
+            &empty,
+            &empty,
+            &empty,
+            "drv-thru:builder-key"
+        ));
+        assert!(signed_cache_import_allowed(
+            false,
+            "alex",
+            &empty,
+            &set(&["root", "alex"]),
+            &empty,
+            "drv-thru:builder-key"
+        ));
+        assert!(signed_cache_import_allowed(
+            false,
+            "alex",
+            &set(&["wheel"]),
+            &set(&["root", "@wheel"]),
+            &empty,
+            "drv-thru:builder-key"
+        ));
+        assert!(signed_cache_import_allowed(
+            false,
+            "alex",
+            &empty,
+            &set(&["*"]),
+            &empty,
+            "drv-thru:builder-key"
+        ));
+    }
+
+    #[test]
+    fn accepts_globally_trusted_builder_key_for_signed_cache_import() {
+        let empty = BTreeSet::new();
+        assert!(signed_cache_import_allowed(
+            false,
+            "alex",
+            &empty,
+            &set(&["root"]),
+            &set(&["drv-thru:builder-key"]),
+            "drv-thru:builder-key"
+        ));
+    }
+
+    #[test]
+    fn rejects_untrusted_user_unknown_builder_key_for_signed_cache_import() {
+        let empty = BTreeSet::new();
+        assert!(!signed_cache_import_allowed(
+            false,
+            "alex",
+            &empty,
+            &set(&["root"]),
+            &set(&["drv-thru:other-key"]),
+            "drv-thru:builder-key"
+        ));
+    }
+
+    fn set(values: &[&str]) -> BTreeSet<String> {
+        values.iter().map(|value| value.to_string()).collect()
     }
 
     #[test]

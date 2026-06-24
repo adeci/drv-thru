@@ -6,136 +6,186 @@
 }:
 let
   cfg = config.services.drv-thru;
+  serverCfg = cfg.server;
+  clientCfg = cfg.client;
   json = pkgs.formats.json { };
+
   serverConfig = json.generate "drv-thru-server.json" {
-    data_dir = cfg.dataDir;
-    secret_key_file = cfg.secretKeyFile;
-    max_concurrent_builds = cfg.maxConcurrentBuilds;
+    data_dir = serverCfg.dataDir;
+    secret_key_file = serverCfg.secretKeyFile;
+    max_concurrent_builds = serverCfg.maxConcurrentBuilds;
     trusted_clients = lib.mapAttrs (_: client: {
       public_key = client.publicKey;
       max_build_time = client.maxBuildTime;
       max_upload_bytes = client.maxUploadBytes;
-    }) cfg.trustedClients;
+    }) serverCfg.trustedClients;
   };
+
+  trustedBuilderPublicKeys = lib.mapAttrsToList (
+    _: builder: builder.publicKey
+  ) clientCfg.trustedBuilders;
 in
 {
   options.services.drv-thru = {
-    enable = lib.mkEnableOption "drv-thru remote Nix builder";
-
     package = lib.mkOption {
       type = lib.types.nullOr lib.types.package;
       default = null;
       description = "Package providing the drv-thru binary.";
     };
 
-    dataDir = lib.mkOption {
-      type = lib.types.str;
-      default = "/var/lib/drv-thru";
-      description = "Directory for server state.";
-    };
+    server = {
+      enable = lib.mkEnableOption "drv-thru remote Nix builder";
 
-    secretKeyFile = lib.mkOption {
-      type = lib.types.str;
-      default = "${cfg.dataDir}/secret.key";
-      description = "Path to the server Iroh secret key.";
-    };
+      dataDir = lib.mkOption {
+        type = lib.types.str;
+        default = "/var/lib/drv-thru";
+        description = "Directory for server state.";
+      };
 
-    maxConcurrentBuilds = lib.mkOption {
-      type = lib.types.ints.positive;
-      default = 1;
-      description = "Maximum active builds processed at once.";
-    };
+      secretKeyFile = lib.mkOption {
+        type = lib.types.str;
+        default = "${serverCfg.dataDir}/secret.key";
+        description = "Path to the server Iroh secret key.";
+      };
 
-    trustedClients = lib.mkOption {
-      default = { };
-      description = "Declarative allowlist of long-lived client keys.";
-      type = lib.types.attrsOf (
-        lib.types.submodule {
-          options = {
-            publicKey = lib.mkOption {
-              type = lib.types.str;
-              description = "Client Iroh endpoint id.";
+      maxConcurrentBuilds = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 1;
+        description = "Maximum active builds processed at once.";
+      };
+
+      trustedClients = lib.mkOption {
+        default = { };
+        description = "Declarative allowlist of long-lived client keys.";
+        type = lib.types.attrsOf (
+          lib.types.submodule {
+            options = {
+              publicKey = lib.mkOption {
+                type = lib.types.str;
+                description = "Client Iroh endpoint id.";
+              };
+
+              maxBuildTime = lib.mkOption {
+                type = lib.types.str;
+                default = "30m";
+                description = "Wall-clock build timeout.";
+              };
+
+              maxUploadBytes = lib.mkOption {
+                type = lib.types.str;
+                default = "20G";
+                description = "Maximum input upload size.";
+              };
             };
-
-            maxBuildTime = lib.mkOption {
-              type = lib.types.str;
-              default = "30m";
-              description = "Wall-clock build timeout.";
-            };
-
-            maxUploadBytes = lib.mkOption {
-              type = lib.types.str;
-              default = "20G";
-              description = "Maximum input upload size.";
-            };
-
-          };
-        }
-      );
-    };
-  };
-
-  config = lib.mkIf cfg.enable {
-    assertions = [
-      {
-        assertion = cfg.package != null;
-        message = "services.drv-thru.package must be set until drv-thru is packaged.";
-      }
-    ];
-
-    nix.settings.trusted-users = [ "drv-thru" ];
-
-    users.groups.drv-thru = { };
-    users.users.drv-thru = {
-      isSystemUser = true;
-      group = "drv-thru";
-      home = cfg.dataDir;
-      createHome = false;
+          }
+        );
+      };
     };
 
-    system.activationScripts.drv-thru-state = lib.stringAfter [ "users" ] ''
-      install -d -o drv-thru -g wheel -m 2770 ${cfg.dataDir}
+    client = {
+      enable = lib.mkEnableOption "drv-thru client CLI";
 
-      if [ -e ${cfg.secretKeyFile} ]; then
-        chown drv-thru:drv-thru ${cfg.secretKeyFile}
-        chmod 0600 ${cfg.secretKeyFile}
-      fi
+      trustedBuilders = lib.mkOption {
+        default = { };
+        description = "Declarative builder signing keys trusted for client-side store imports.";
+        type = lib.types.attrsOf (
+          lib.types.submodule {
+            options = {
+              endpointId = lib.mkOption {
+                type = lib.types.str;
+                description = "Builder Iroh endpoint id.";
+              };
 
-      if [ -e ${cfg.dataDir}/signing-secret.key ]; then
-        chown drv-thru:drv-thru ${cfg.dataDir}/signing-secret.key
-        chmod 0600 ${cfg.dataDir}/signing-secret.key
-      fi
+              publicKey = lib.mkOption {
+                type = lib.types.str;
+                description = "Builder binary-cache signing public key.";
+              };
 
-      if [ -e ${cfg.dataDir}/signing-public.key ]; then
-        chown drv-thru:drv-thru ${cfg.dataDir}/signing-public.key
-        chmod 0644 ${cfg.dataDir}/signing-public.key
-      fi
-
-      for file in ${cfg.dataDir}/server-addr.json ${cfg.dataDir}/tickets.json; do
-        if [ -e "$file" ]; then
-          chown drv-thru:wheel "$file"
-          chmod 0660 "$file"
-        fi
-      done
-    '';
-
-    systemd.services.drv-thru = {
-      description = "drv-thru remote Nix builder";
-      path = [ pkgs.nix ];
-      wantedBy = [ "multi-user.target" ];
-      wants = [ "network-online.target" ];
-      after = [
-        "network-online.target"
-        "nix-daemon.service"
-      ];
-
-      serviceConfig = {
-        ExecStart = "${lib.getExe cfg.package} serve --config ${serverConfig}";
-        Restart = "on-failure";
-        User = "drv-thru";
-        Group = "drv-thru";
-        SupplementaryGroups = [ "wheel" ];
+              relayUrl = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                description = "Optional builder Iroh relay URL.";
+              };
+            };
+          }
+        );
       };
     };
   };
+
+  config = lib.mkMerge [
+    {
+      assertions = [
+        {
+          assertion = (!serverCfg.enable && !clientCfg.enable) || cfg.package != null;
+          message = "services.drv-thru.package must be set when the drv-thru server or client is enabled.";
+        }
+      ];
+    }
+
+    (lib.mkIf (clientCfg.enable && trustedBuilderPublicKeys != [ ]) {
+      nix.settings.trusted-public-keys = lib.mkAfter trustedBuilderPublicKeys;
+    })
+
+    (lib.mkIf clientCfg.enable {
+      environment.systemPackages = [ cfg.package ];
+    })
+
+    (lib.mkIf serverCfg.enable {
+      nix.settings.trusted-users = [ "drv-thru" ];
+
+      users.groups.drv-thru = { };
+      users.users.drv-thru = {
+        isSystemUser = true;
+        group = "drv-thru";
+        home = serverCfg.dataDir;
+        createHome = false;
+      };
+
+      system.activationScripts.drv-thru-state = lib.stringAfter [ "users" ] ''
+        install -d -o drv-thru -g wheel -m 2770 ${serverCfg.dataDir}
+
+        if [ -e ${serverCfg.secretKeyFile} ]; then
+          chown drv-thru:drv-thru ${serverCfg.secretKeyFile}
+          chmod 0600 ${serverCfg.secretKeyFile}
+        fi
+
+        if [ -e ${serverCfg.dataDir}/signing-secret.key ]; then
+          chown drv-thru:drv-thru ${serverCfg.dataDir}/signing-secret.key
+          chmod 0600 ${serverCfg.dataDir}/signing-secret.key
+        fi
+
+        if [ -e ${serverCfg.dataDir}/signing-public.key ]; then
+          chown drv-thru:drv-thru ${serverCfg.dataDir}/signing-public.key
+          chmod 0644 ${serverCfg.dataDir}/signing-public.key
+        fi
+
+        for file in ${serverCfg.dataDir}/server-addr.json ${serverCfg.dataDir}/tickets.json; do
+          if [ -e "$file" ]; then
+            chown drv-thru:wheel "$file"
+            chmod 0660 "$file"
+          fi
+        done
+      '';
+
+      systemd.services.drv-thru = {
+        description = "drv-thru remote Nix builder";
+        path = [ pkgs.nix ];
+        wantedBy = [ "multi-user.target" ];
+        wants = [ "network-online.target" ];
+        after = [
+          "network-online.target"
+          "nix-daemon.service"
+        ];
+
+        serviceConfig = {
+          ExecStart = "${lib.getExe cfg.package} serve --config ${serverConfig}";
+          Restart = "on-failure";
+          User = "drv-thru";
+          Group = "drv-thru";
+          SupplementaryGroups = [ "wheel" ];
+        };
+      };
+    })
+  ];
 }
