@@ -101,6 +101,16 @@ in
         chmod 0600 ${cfg.secretKeyFile}
       fi
 
+      if [ -e ${cfg.dataDir}/signing-secret.key ]; then
+        chown drv-thru:drv-thru ${cfg.dataDir}/signing-secret.key
+        chmod 0600 ${cfg.dataDir}/signing-secret.key
+      fi
+
+      if [ -e ${cfg.dataDir}/signing-public.key ]; then
+        chown drv-thru:drv-thru ${cfg.dataDir}/signing-public.key
+        chmod 0644 ${cfg.dataDir}/signing-public.key
+      fi
+
       for file in ${cfg.dataDir}/server-addr.json ${cfg.dataDir}/tickets.json; do
         if [ -e "$file" ]; then
           chown drv-thru:wheel "$file"

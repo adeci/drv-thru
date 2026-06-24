@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-pub const ALPN: &[u8] = b"drv-thru/0";
-pub const VERSION: u32 = 0;
+pub const ALPN: &[u8] = b"drv-thru/1";
+pub const VERSION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -20,7 +20,10 @@ pub enum Message {
     BuildFinished(BuildFinished),
     OutputClosure(PathListChunk),
     OutputRequest(PathListChunk),
-    OutputDownloadReady(OutputDownloadReady),
+    OutputCacheReady(OutputCacheReady),
+    OutputCacheDone,
+    CacheFileRequest(CacheFileRequest),
+    CacheFileResponse(CacheFileResponse),
     Done,
     Error(ErrorMessage),
 }
@@ -74,9 +77,24 @@ pub struct BuildFinished {
     pub output_paths: Vec<String>,
 }
 
+/// Temporary signed binary cache; file bytes move on separate Iroh bi streams.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct OutputDownloadReady {
-    pub path_count: usize,
+pub struct OutputCacheReady {
+    pub public_key: String,
+    pub copy_paths: Vec<String>,
+}
+
+/// Request for one sanitized binary-cache file path.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CacheFileRequest {
+    pub path: String,
+    pub send_body: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CacheFileResponse {
+    pub found: bool,
+    pub byte_count: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

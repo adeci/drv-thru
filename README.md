@@ -6,7 +6,7 @@
 
 Remote Nix builds over Iroh.
 
-Run `drv-thru` on a NixOS builder, give someone a ticket, and they can build on that machine. Missing inputs and outputs move as normal Nix export/import streams. No SSH user setup or network shenanagins needed!
+Run `drv-thru` on a NixOS builder, give someone a ticket, and they can build on that machine. Missing inputs still upload as Nix export streams; requested outputs download through a temporary signed binary cache over Iroh. No SSH user setup or network shenanigans needed.
 
 ## Quick Start
 
@@ -121,3 +121,4 @@ drv-thru build nixpkgs#hello \
 - Trusted-client builds use a persistent client key at `~/.config/drv-thru/secret.key`.
 - Ticket builds use ephemeral Iroh client keys by default.
 - Build logs render through local `nom --json` by default; use `--no-nom` for raw stderr logs.
+- Output imports temporarily trust the builder public key for that `nix copy`; no global client Nix config is changed.

@@ -1,19 +1,27 @@
-use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    fs,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result, bail};
 use iroh::{
     Endpoint, EndpointId,
     endpoint::{Connection, RecvStream, SendStream, presets},
 };
-use tokio::sync::Semaphore;
+use tokio::{io::AsyncReadExt, sync::Semaphore, task::JoinSet};
 
 use crate::{
     access::AccessPolicy,
+    cache,
     config::{DEFAULT_MAX_CONCURRENT_BUILDS, load_server_config, parse_byte_count, parse_duration},
     keys, nix,
     proto::{
-        ALPN, AuthOk, BuildFinished, BuildRequest, ErrorMessage, Message, NixLog,
-        OutputDownloadReady, OutputMode, PathListChunk, VERSION,
+        ALPN, AuthOk, BuildFinished, BuildRequest, CacheFileResponse, ErrorMessage, Message,
+        NixLog, OutputCacheReady, OutputMode, PathListChunk, VERSION,
     },
     ticket::{self, TicketStore},
     wire,
@@ -74,6 +82,7 @@ pub async fn serve(mode: ServeMode) -> Result<()> {
         }
     };
 
+    let signing_key = Arc::new(keys::load_or_create_signing_key(&data_dir)?);
     let key_path = secret_key_file.unwrap_or_else(|| keys::server_key_path(&data_dir));
     let key = keys::load_or_create(key_path)?;
     let endpoint = Endpoint::builder(presets::N0)
@@ -106,6 +115,7 @@ pub async fn serve(mode: ServeMode) -> Result<()> {
                 let access_policy = access_policy.clone();
                 let ticket_store = ticket_store.clone();
                 let build_queue = build_queue.clone();
+                let signing_key = signing_key.clone();
                 tokio::spawn(async move {
                     let conn = match incoming.await {
                         Ok(conn) => conn,
@@ -115,7 +125,7 @@ pub async fn serve(mode: ServeMode) -> Result<()> {
                         }
                     };
 
-                    if let Err(err) = handle_incoming(conn, access_policy, ticket_store, build_queue).await {
+                    if let Err(err) = handle_incoming(conn, access_policy, ticket_store, build_queue, signing_key).await {
                         eprintln!("connection error: {err:#}");
                     }
                 });
@@ -132,6 +142,7 @@ async fn handle_incoming(
     access_policy: AccessPolicy,
     ticket_store: TicketStore,
     build_queue: Arc<Semaphore>,
+    signing_key: Arc<keys::SigningKey>,
 ) -> Result<()> {
     let peer = conn.remote_id();
     let (mut send, mut recv) = conn.accept_bi().await?;
@@ -195,7 +206,7 @@ async fn handle_incoming(
                 return Ok(());
             }
         };
-        run_queued_build(&conn, &mut send, &mut recv, build, authorized).await
+        run_queued_build(&conn, &mut send, &mut recv, build, authorized, &signing_key).await
     };
 
     if let Err(err) = build_result {
@@ -344,6 +355,7 @@ async fn run_queued_build(
     recv: &mut RecvStream,
     build: CheckedBuildRequest,
     authorized: AuthorizedConnection,
+    signing_key: &keys::SigningKey,
 ) -> Result<()> {
     let missing_paths = nix::missing_paths(&build.closure_paths).await?;
     println!(
@@ -373,7 +385,7 @@ async fn run_queued_build(
     )
     .await?;
     if finished.success {
-        export_outputs(conn, send, recv, &finished.output_paths).await?;
+        export_outputs(conn, send, recv, &finished.output_paths, signing_key).await?;
     }
 
     Ok(())
@@ -445,6 +457,7 @@ async fn export_outputs(
     send: &mut SendStream,
     recv: &mut RecvStream,
     output_paths: &[nix::StorePath],
+    signing_key: &keys::SigningKey,
 ) -> Result<()> {
     let closure = nix::output_closure(output_paths).await?;
     write_path_chunks(
@@ -463,19 +476,146 @@ async fn export_outputs(
         return wire::write_json(send, &Message::Done).await;
     }
 
+    let cache_dir = TempCacheDir::new()?;
+    nix::copy_to_signed_binary_cache(&requested, cache_dir.path(), &signing_key.secret_path)
+        .await?;
+
     wire::write_json(
         send,
-        &Message::OutputDownloadReady(OutputDownloadReady {
-            path_count: requested.len(),
+        &Message::OutputCacheReady(OutputCacheReady {
+            public_key: signing_key.public_key.clone(),
+            copy_paths: store_paths_to_strings(&requested),
         }),
     )
     .await?;
 
-    let mut stream = conn.open_uni().await.context("open output stream")?;
-    nix::export_paths(&requested, &mut stream).await?;
-    stream.finish()?;
-
+    serve_output_cache(conn, recv, cache_dir.path()).await?;
     wire::write_json(send, &Message::Done).await
+}
+
+async fn serve_output_cache(
+    conn: &Connection,
+    recv: &mut RecvStream,
+    cache_dir: &Path,
+) -> Result<()> {
+    let mut tasks = JoinSet::new();
+    loop {
+        tokio::select! {
+            message = wire::read_json::<Message>(recv) => {
+                match message? {
+                    Message::OutputCacheDone => break,
+                    Message::Error(err) => bail!("{}", err.message),
+                    message => bail!("unexpected output cache message: {message:?}"),
+                }
+            }
+            accepted = conn.accept_bi() => {
+                let (send, recv) = accepted.context("accept cache file stream")?;
+                let cache_dir = cache_dir.to_path_buf();
+                tasks.spawn(async move { handle_cache_file_stream(send, recv, cache_dir).await });
+            }
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                result.context("cache file task panicked")???;
+            }
+        }
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        result.context("cache file task panicked")??;
+    }
+    Ok(())
+}
+
+async fn handle_cache_file_stream(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    cache_dir: PathBuf,
+) -> Result<()> {
+    let request = match read_message_with_timeout(&mut recv, CONTROL_TIMEOUT).await? {
+        Message::CacheFileRequest(request) => request,
+        message => bail!("unexpected cache file request: {message:?}"),
+    };
+
+    let path = cache::cache_file_path(&cache_dir, &request.path)?;
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            write_cache_file_response(&mut send, false, 0).await?;
+            send.finish()?;
+            return Ok(());
+        }
+        Err(err) => return Err(err).with_context(|| format!("open {}", path.display())),
+    };
+
+    let byte_count = file
+        .metadata()
+        .await
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    write_cache_file_response(&mut send, true, byte_count).await?;
+
+    if request.send_body {
+        let mut body = file.take(byte_count);
+        let copied = tokio::io::copy(&mut body, &mut send)
+            .await
+            .with_context(|| format!("stream {}", path.display()))?;
+        if copied != byte_count {
+            bail!("short cache file read: {copied} of {byte_count} bytes");
+        }
+    }
+
+    send.finish()?;
+    Ok(())
+}
+
+async fn write_cache_file_response(
+    send: &mut SendStream,
+    found: bool,
+    byte_count: u64,
+) -> Result<()> {
+    wire::write_json(
+        send,
+        &Message::CacheFileResponse(CacheFileResponse { found, byte_count }),
+    )
+    .await
+}
+
+struct TempCacheDir {
+    path: PathBuf,
+}
+
+impl TempCacheDir {
+    fn new() -> Result<Self> {
+        let base = std::env::temp_dir();
+        fs::create_dir_all(&base).with_context(|| format!("create {}", base.display()))?;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+
+        for attempt in 0..100 {
+            let path = base.join(format!(
+                "drv-thru-cache-{}-{nanos}-{attempt}",
+                std::process::id()
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err).with_context(|| format!("create {}", path.display())),
+            }
+        }
+
+        bail!("failed to create temporary output cache directory")
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempCacheDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }
 
 fn requested_output_paths(
@@ -525,7 +665,7 @@ async fn import_missing_inputs(
         .context("input upload timed out")??;
     tokio::time::timeout(
         UPLOAD_TIMEOUT,
-        nix::import_paths(&mut recv, max_upload_bytes),
+        nix::import_unsigned_export_stream(&mut recv, max_upload_bytes),
     )
     .await
     .context("input upload timed out")??;

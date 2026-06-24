@@ -1,4 +1,5 @@
 mod access;
+mod cache;
 mod cli;
 mod client;
 mod client_status;

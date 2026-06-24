@@ -2,12 +2,19 @@ use std::{
     fs,
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
+    process::Command,
     str::FromStr,
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use iroh::SecretKey;
+
+#[derive(Clone)]
+pub struct SigningKey {
+    pub secret_path: PathBuf,
+    pub public_key: String,
+}
 
 pub struct KeyFileLock {
     path: PathBuf,
@@ -67,6 +74,77 @@ pub async fn lock_key_file(path: &Path) -> Result<KeyFileLock> {
 
 pub fn server_key_path(data_dir: &Path) -> PathBuf {
     data_dir.join("secret.key")
+}
+
+pub fn signing_secret_key_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("signing-secret.key")
+}
+
+pub fn signing_public_key_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("signing-public.key")
+}
+
+pub fn load_or_create_signing_key(data_dir: &Path) -> Result<SigningKey> {
+    let secret_path = signing_secret_key_path(data_dir);
+    let public_path = signing_public_key_path(data_dir);
+
+    match (secret_path.exists(), public_path.exists()) {
+        (true, true) => {
+            check_key_permissions(&secret_path)?;
+            Ok(SigningKey {
+                secret_path,
+                public_key: read_public_signing_key(&public_path)?,
+            })
+        }
+        (false, false) => {
+            generate_signing_keypair(data_dir, &secret_path, &public_path)?;
+            check_key_permissions(&secret_path)?;
+            Ok(SigningKey {
+                secret_path,
+                public_key: read_public_signing_key(&public_path)?,
+            })
+        }
+        _ => bail!(
+            "incomplete signing keypair; expected both {} and {}",
+            secret_path.display(),
+            public_path.display()
+        ),
+    }
+}
+
+fn generate_signing_keypair(data_dir: &Path, secret_path: &Path, public_path: &Path) -> Result<()> {
+    fs::create_dir_all(data_dir).with_context(|| format!("create {}", data_dir.display()))?;
+
+    let output = Command::new("nix-store")
+        .arg("--generate-binary-cache-key")
+        .arg("drv-thru")
+        .arg(secret_path)
+        .arg(public_path)
+        .output()
+        .context("run nix-store --generate-binary-cache-key")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "nix-store --generate-binary-cache-key failed: {}",
+            stderr.trim()
+        );
+    }
+
+    set_private_key_permissions(secret_path)?;
+    set_public_key_permissions(public_path)?;
+    Ok(())
+}
+
+fn read_public_signing_key(path: &Path) -> Result<String> {
+    let key = fs::read_to_string(path)
+        .with_context(|| format!("read signing public key {}", path.display()))?
+        .trim()
+        .to_string();
+    if key.is_empty() {
+        bail!("signing public key is empty: {}", path.display());
+    }
+    Ok(key)
 }
 
 fn read_key(path: &Path) -> Result<SecretKey> {
@@ -145,6 +223,28 @@ fn remove_key_file_lock(path: &Path) -> Result<()> {
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err).with_context(|| format!("remove {}", path.display())),
     }
+}
+
+fn set_private_key_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 600 {}", path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn set_public_key_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644))
+            .with_context(|| format!("chmod 644 {}", path.display()))?;
+    }
+
+    Ok(())
 }
 
 fn check_key_permissions(path: &Path) -> Result<()> {

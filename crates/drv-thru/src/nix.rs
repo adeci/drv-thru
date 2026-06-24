@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeSet,
     future::Future,
+    path::Path,
     process::{Output, Stdio},
 };
 
@@ -172,14 +173,7 @@ pub async fn output_closure(paths: &[StorePath]) -> Result<Vec<StorePath>> {
     query_closure(paths).await
 }
 
-pub async fn import_outputs<R>(reader: &mut R) -> Result<()>
-where
-    R: AsyncRead + Unpin + ?Sized,
-{
-    import_paths(reader, None).await.map(|_| ())
-}
-
-pub async fn import_paths<R>(reader: &mut R, max_bytes: Option<u64>) -> Result<u64>
+pub async fn import_unsigned_export_stream<R>(reader: &mut R, max_bytes: Option<u64>) -> Result<u64>
 where
     R: AsyncRead + Unpin + ?Sized,
 {
@@ -234,6 +228,91 @@ where
     }
 
     Ok(copied)
+}
+
+pub async fn copy_to_signed_binary_cache(
+    paths: &[StorePath],
+    cache_dir: &Path,
+    secret_key: &Path,
+) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    let cache_url = file_cache_url(cache_dir, Some(secret_key))?;
+    for chunk in paths.chunks(PATH_ARG_CHUNK_SIZE) {
+        let mut args = vec!["copy".to_string(), "--to".to_string(), cache_url.clone()];
+        args.extend(chunk.iter().map(|path| path.as_str().to_string()));
+        run_nix_command(args, "nix copy to signed binary cache").await?;
+    }
+    Ok(())
+}
+
+pub async fn copy_from_signed_binary_cache(
+    cache_url: &str,
+    public_key: &str,
+    paths: &[StorePath],
+) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    let public_key = public_key.trim();
+    if public_key.is_empty() {
+        bail!("trusted public key is empty");
+    }
+
+    for chunk in paths.chunks(PATH_ARG_CHUNK_SIZE) {
+        let mut args = vec![
+            "copy".to_string(),
+            "--from".to_string(),
+            cache_url.to_string(),
+            "--option".to_string(),
+            "require-sigs".to_string(),
+            "true".to_string(),
+            "--option".to_string(),
+            "trusted-public-keys".to_string(),
+            public_key.to_string(),
+        ];
+        args.extend(chunk.iter().map(|path| path.as_str().to_string()));
+        run_nix_command(args, "nix copy from signed binary cache").await?;
+    }
+    Ok(())
+}
+
+fn file_cache_url(cache_dir: &Path, secret_key: Option<&Path>) -> Result<String> {
+    let cache_dir = path_to_str(cache_dir)?;
+    let mut url = format!("file://{cache_dir}");
+    if let Some(secret_key) = secret_key {
+        url.push_str("?secret-key=");
+        url.push_str(path_to_str(secret_key)?);
+    }
+    Ok(url)
+}
+
+fn path_to_str(path: &Path) -> Result<&str> {
+    path.to_str()
+        .with_context(|| format!("path is not UTF-8: {}", path.display()))
+}
+
+async fn run_nix_command(args: Vec<String>, context: &str) -> Result<()> {
+    let output = Command::new("nix")
+        .args(&args)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .with_context(|| format!("run {context}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            bail!("{context} failed with {}", output.status);
+        }
+        bail!("{context} failed: {stderr}");
+    }
+
+    Ok(())
 }
 
 async fn query_closure(paths: &[StorePath]) -> Result<Vec<StorePath>> {

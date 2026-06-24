@@ -7,18 +7,23 @@ use iroh::{
     endpoint::{Connection, RecvStream, SendStream, presets},
 };
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
     process::{Child, ChildStdin, Command},
+    sync::oneshot,
+    task::JoinSet,
 };
 
 const PATH_CHUNK_SIZE: usize = 512;
+const CACHE_FILE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::{
-    client_status::{ClientStatus, ProgressReader, ProgressWriter},
+    cache,
+    client_status::{ClientStatus, ProgressReader, ProgressWriter, TransferProgress},
     keys, nix,
     proto::{
-        ALPN, AuthTicket, BuildFinished, BuildRequest, Hello, Message, OutputDownloadReady,
-        OutputMode, PathListChunk, VERSION,
+        ALPN, AuthTicket, BuildFinished, BuildRequest, CacheFileRequest, CacheFileResponse, Hello,
+        Message, OutputCacheReady, OutputMode, PathListChunk, VERSION,
     },
     ticket::BuildTicket,
     wire,
@@ -172,7 +177,7 @@ pub async fn build(
     let missing_outputs = locally_missing_paths(&output_closure, &mut status).await?;
     write_path_chunks(&mut send, &missing_outputs, Message::OutputRequest).await?;
 
-    let received_bytes = import_output_chunks(&conn, &mut recv, &mut status).await?;
+    let received_bytes = import_output_cache(&conn, &mut send, &mut recv, &mut status).await?;
 
     status.phase("done");
     status.clear_phase();
@@ -348,18 +353,30 @@ async fn locally_missing_paths(paths: &[String], status: &mut ClientStatus) -> R
         .collect())
 }
 
-async fn import_output_chunks(
+async fn import_output_cache(
     conn: &Connection,
+    send: &mut SendStream,
     recv: &mut RecvStream,
     status: &mut ClientStatus,
 ) -> Result<u64> {
+    status.phase("preparing output cache");
     match wire::read_json::<Message>(recv).await? {
-        Message::OutputDownloadReady(download) => {
-            let received_bytes = import_outputs(conn, &download, status).await?;
-            match wire::read_json::<Message>(recv).await? {
-                Message::Done => Ok(received_bytes),
-                Message::Error(err) => bail!("{}", err.message),
-                message => bail!("unexpected server message: {message:?}"),
+        Message::OutputCacheReady(cache) => {
+            let import_result = import_outputs_from_cache(conn.clone(), &cache, status).await;
+            let done_result = wire::write_json(send, &Message::OutputCacheDone).await;
+            let server_done_result = if done_result.is_ok() {
+                read_server_done(recv).await
+            } else {
+                Ok(())
+            };
+
+            match import_result {
+                Ok(bytes) => {
+                    done_result?;
+                    server_done_result?;
+                    Ok(bytes)
+                }
+                Err(err) => Err(err),
             }
         }
         Message::Done => Ok(0),
@@ -368,26 +385,271 @@ async fn import_output_chunks(
     }
 }
 
-async fn import_outputs(
-    conn: &Connection,
-    download: &OutputDownloadReady,
+async fn read_server_done(recv: &mut RecvStream) -> Result<()> {
+    match wire::read_json::<Message>(recv).await? {
+        Message::Done => Ok(()),
+        Message::Error(err) => bail!("{}", err.message),
+        message => bail!("unexpected server message: {message:?}"),
+    }
+}
+
+async fn import_outputs_from_cache(
+    conn: Connection,
+    cache: &OutputCacheReady,
     status: &mut ClientStatus,
 ) -> Result<u64> {
-    let stream = conn.accept_uni().await.context("accept output stream")?;
-    let message = format!(
-        "recv {} {}",
-        download.path_count,
-        path_word(download.path_count)
-    );
+    let copy_paths = cache
+        .copy_paths
+        .iter()
+        .cloned()
+        .map(nix::StorePath::new)
+        .collect::<Result<Vec<_>>>()?;
+    let message = format!("recv {} {}", copy_paths.len(), path_word(copy_paths.len()));
     let progress = status.transfer(message);
-    let mut stream = ProgressReader::new(stream, progress.clone());
+    let bridge = CacheBridge::start(conn, progress.clone()).await?;
 
-    let result = nix::import_outputs(&mut stream).await;
+    let copy_result =
+        nix::copy_from_signed_binary_cache(bridge.url(), &cache.public_key, &copy_paths).await;
+    let bridge_result = bridge.shutdown().await;
     let bytes = progress.bytes();
     progress.finish_and_clear();
-    result?;
 
+    copy_result?;
+    bridge_result?;
     Ok(bytes)
+}
+
+struct CacheBridge {
+    url: String,
+    shutdown: Option<oneshot::Sender<()>>,
+    handle: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl CacheBridge {
+    async fn start(conn: Connection, progress: TransferProgress) -> Result<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .context("bind local cache bridge")?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(run_cache_bridge(listener, conn, progress, shutdown_rx));
+
+        Ok(Self {
+            url,
+            shutdown: Some(shutdown_tx),
+            handle,
+        })
+    }
+
+    fn url(&self) -> &str {
+        &self.url
+    }
+
+    async fn shutdown(mut self) -> Result<()> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        self.handle.await.context("cache bridge task panicked")?
+    }
+}
+
+async fn run_cache_bridge(
+    listener: TcpListener,
+    conn: Connection,
+    progress: TransferProgress,
+    mut shutdown: oneshot::Receiver<()>,
+) -> Result<()> {
+    let mut tasks = JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => {
+                let (stream, _) = accepted.context("accept local cache HTTP connection")?;
+                let conn = conn.clone();
+                let progress = progress.clone();
+                tasks.spawn(async move { handle_cache_http(stream, conn, progress).await });
+            }
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                result.context("cache HTTP task panicked")???;
+            }
+        }
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        result.context("cache HTTP task panicked")??;
+    }
+    Ok(())
+}
+
+async fn handle_cache_http(
+    mut stream: TcpStream,
+    conn: Connection,
+    progress: TransferProgress,
+) -> Result<()> {
+    let request = match read_http_request(&mut stream).await {
+        Ok(request) => request,
+        Err(err) => {
+            let _ = write_http_head(&mut stream, 400, 0).await;
+            return Err(err);
+        }
+    };
+
+    if !matches!(request.method, HttpMethod::Get | HttpMethod::Head) {
+        write_http_head(&mut stream, 405, 0).await?;
+        return Ok(());
+    }
+
+    let path = match cache::sanitize_http_cache_path(&request.target) {
+        Ok(path) => path,
+        Err(_) => {
+            write_http_head(&mut stream, 400, 0).await?;
+            return Ok(());
+        }
+    };
+
+    let send_body = matches!(request.method, HttpMethod::Get);
+    let fetched = match fetch_cache_file(&conn, &path, send_body).await {
+        Ok(fetched) => fetched,
+        Err(err) => {
+            let _ = write_http_head(&mut stream, 502, 0).await;
+            return Err(err);
+        }
+    };
+
+    let Some(mut fetched) = fetched else {
+        write_http_head(&mut stream, 404, 0).await?;
+        return Ok(());
+    };
+
+    write_http_head(&mut stream, 200, fetched.byte_count).await?;
+    if let Some(body) = fetched.body.take() {
+        let mut body = ProgressReader::new(body.take(fetched.byte_count), progress);
+        let copied = tokio::io::copy(&mut body, &mut stream)
+            .await
+            .context("stream cache body to local Nix")?;
+        if copied != fetched.byte_count {
+            bail!("short cache body: {copied} of {} bytes", fetched.byte_count);
+        }
+    }
+    Ok(())
+}
+
+struct HttpRequest {
+    method: HttpMethod,
+    target: String,
+}
+
+#[derive(Clone, Copy)]
+enum HttpMethod {
+    Get,
+    Head,
+    Other,
+}
+
+struct FetchedCacheFile {
+    byte_count: u64,
+    body: Option<RecvStream>,
+}
+
+async fn fetch_cache_file(
+    conn: &Connection,
+    path: &str,
+    send_body: bool,
+) -> Result<Option<FetchedCacheFile>> {
+    let (mut send, mut recv) = tokio::time::timeout(CACHE_FILE_RESPONSE_TIMEOUT, conn.open_bi())
+        .await
+        .context("open cache file stream timed out")?
+        .context("open cache file stream")?;
+    wire::write_json(
+        &mut send,
+        &Message::CacheFileRequest(CacheFileRequest {
+            path: path.to_string(),
+            send_body,
+        }),
+    )
+    .await?;
+    send.finish()?;
+
+    let message = tokio::time::timeout(
+        CACHE_FILE_RESPONSE_TIMEOUT,
+        wire::read_json::<Message>(&mut recv),
+    )
+    .await
+    .context("cache file response timed out")??;
+    let response = match message {
+        Message::CacheFileResponse(CacheFileResponse { found, byte_count }) => {
+            CacheFileResponse { found, byte_count }
+        }
+        Message::Error(err) => bail!("{}", err.message),
+        message => bail!("unexpected cache response: {message:?}"),
+    };
+
+    if !response.found {
+        return Ok(None);
+    }
+
+    Ok(Some(FetchedCacheFile {
+        byte_count: response.byte_count,
+        body: send_body.then_some(recv),
+    }))
+}
+
+async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    loop {
+        let read = stream.read(&mut chunk).await.context("read HTTP request")?;
+        if read == 0 {
+            bail!("HTTP request closed before headers");
+        }
+        buf.extend_from_slice(&chunk[..read]);
+        if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+        if buf.len() > 16 * 1024 {
+            bail!("HTTP request headers too large");
+        }
+    }
+
+    let request = std::str::from_utf8(&buf).context("HTTP request was not UTF-8")?;
+    let first_line = request
+        .lines()
+        .next()
+        .context("HTTP request missing line")?;
+    let mut parts = first_line.split_whitespace();
+    let method = match parts.next().context("HTTP request missing method")? {
+        "GET" => HttpMethod::Get,
+        "HEAD" => HttpMethod::Head,
+        _ => HttpMethod::Other,
+    };
+    let target = parts
+        .next()
+        .context("HTTP request missing target")?
+        .to_string();
+    let version = parts.next().context("HTTP request missing version")?;
+    if !version.starts_with("HTTP/1.") || parts.next().is_some() {
+        bail!("invalid HTTP request line");
+    }
+
+    Ok(HttpRequest { method, target })
+}
+
+async fn write_http_head(stream: &mut TcpStream, code: u16, content_length: u64) -> Result<()> {
+    let reason = match code {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        502 => "Bad Gateway",
+        _ => "Error",
+    };
+    let response = format!(
+        "HTTP/1.1 {code} {reason}\r\nContent-Length: {content_length}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .context("write HTTP response")
 }
 
 enum LogRenderer {
