@@ -1,4 +1,8 @@
-use std::{path::Path, time::Duration};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -17,7 +21,8 @@ use crate::{
     wire,
 };
 
-const CACHE_FILE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const CACHE_FILE_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+const CACHE_FILE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 pub(crate) async fn preflight_output_import(public_key: &str) -> Result<()> {
     let _ = output_import_method(public_key).await?;
@@ -248,6 +253,7 @@ async fn run_cache_bridge(
     mut shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
     let mut tasks = JoinSet::new();
+    let first_error = Arc::new(Mutex::new(None));
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
@@ -255,16 +261,32 @@ async fn run_cache_bridge(
                 let (stream, _) = accepted.context("accept local cache HTTP connection")?;
                 let conn = conn.clone();
                 let progress = progress.clone();
-                tasks.spawn(async move { handle_cache_http(stream, conn, progress).await });
+                let first_error = first_error.clone();
+                tasks.spawn(async move {
+                    if let Err(err) = handle_cache_http(stream, conn, progress).await {
+                        let message = err.to_string();
+                        eprintln!("cache bridge request failed: {message}");
+                        if let Ok(mut first_error) = first_error.lock() {
+                            first_error.get_or_insert(message);
+                        }
+                    }
+                });
             }
             result = tasks.join_next(), if !tasks.is_empty() => {
-                result.context("cache HTTP task panicked")???;
+                if let Some(result) = result {
+                    result.context("cache HTTP task panicked")?;
+                }
             }
         }
     }
 
     while let Some(result) = tasks.join_next().await {
-        result.context("cache HTTP task panicked")??;
+        result.context("cache HTTP task panicked")?;
+    }
+    if let Ok(mut first_error) = first_error.lock()
+        && let Some(first_error) = first_error.take()
+    {
+        bail!("{first_error}");
     }
     Ok(())
 }
@@ -299,8 +321,12 @@ async fn handle_cache_http(
     let fetched = match fetch_cache_file(&conn, &path, send_body).await {
         Ok(fetched) => fetched,
         Err(err) => {
-            let _ =
-                write_http_error(&mut stream, 502, &format!("cache fetch failed: {path}\n")).await;
+            let _ = write_http_error(
+                &mut stream,
+                502,
+                &format!("cache fetch failed: {path}: {err:#}\n"),
+            )
+            .await;
             return Err(err).with_context(|| format!("cache bridge returned 502 for {path}"));
         }
     };
@@ -345,7 +371,7 @@ async fn fetch_cache_file(
     path: &str,
     send_body: bool,
 ) -> Result<Option<FetchedCacheFile>> {
-    let (mut send, mut recv) = tokio::time::timeout(CACHE_FILE_RESPONSE_TIMEOUT, conn.open_bi())
+    let (mut send, mut recv) = tokio::time::timeout(CACHE_FILE_STREAM_OPEN_TIMEOUT, conn.open_bi())
         .await
         .context("open cache file stream timed out")?
         .context("open cache file stream")?;

@@ -1,12 +1,14 @@
 use super::*;
 
 const NIX_CACHE_INFO: &[u8] = b"StoreDir: /nix/store\n";
+const MAX_PARALLEL_CACHE_FILLS: usize = 4;
 
 #[derive(Clone)]
 pub(super) struct OutputCache {
     dir: PathBuf,
     signing_key: Arc<keys::SigningKey>,
-    fill_lock: Arc<Mutex<()>>,
+    fill_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
+    fill_permits: Arc<Semaphore>,
 }
 
 impl OutputCache {
@@ -18,12 +20,21 @@ impl OutputCache {
         Ok(Self {
             dir,
             signing_key,
-            fill_lock: Arc::new(Mutex::new(())),
+            fill_locks: Arc::new(Mutex::new(BTreeMap::new())),
+            fill_permits: Arc::new(Semaphore::new(MAX_PARALLEL_CACHE_FILLS)),
         })
     }
 
     pub(super) fn public_key(&self) -> &str {
         &self.signing_key.public_key
+    }
+
+    async fn fill_lock(&self, store_hash: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.fill_locks.lock().await;
+        locks
+            .entry(store_hash.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 }
 
@@ -94,6 +105,10 @@ pub(super) async fn export_outputs(
         "output cache: serving persistent cache files over Iroh from {}",
         output_cache.dir.display()
     );
+    tokio::spawn(prewarm_output_cache(
+        output_cache.clone(),
+        requested.clone(),
+    ));
     serve_output_cache(conn, recv, output_cache.clone(), access).await?;
     println!(
         "output cache: served in {:.1}s",
@@ -125,13 +140,19 @@ async fn serve_output_cache(
                 tasks.spawn(async move { handle_cache_file_stream(send, recv, cache, access).await });
             }
             result = tasks.join_next(), if !tasks.is_empty() => {
-                result.context("cache file task panicked")???;
+                if let Some(result) = result
+                    && let Err(err) = result.context("cache file task panicked")?
+                {
+                    eprintln!("output cache request failed: {err:#}");
+                }
             }
         }
     }
 
     while let Some(result) = tasks.join_next().await {
-        result.context("cache file task panicked")??;
+        if let Err(err) = result.context("cache file task panicked")? {
+            eprintln!("output cache request failed: {err:#}");
+        }
     }
     Ok(())
 }
@@ -259,6 +280,42 @@ async fn stream_cache_bytes(
     Ok(())
 }
 
+async fn prewarm_output_cache(cache: OutputCache, paths: Vec<nix::StorePath>) {
+    let started = Instant::now();
+    let path_count = paths.len();
+    let mut tasks = JoinSet::new();
+    for path in paths {
+        let cache = cache.clone();
+        tasks.spawn(async move {
+            ensure_cache_entry(&cache, &path)
+                .await
+                .with_context(|| format!("prewarm {}", path.as_str()))
+        });
+    }
+
+    let mut failures = 0usize;
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                failures += 1;
+                eprintln!("output cache: prewarm failed: {err:#}");
+            }
+            Err(err) => {
+                failures += 1;
+                eprintln!("output cache: prewarm task panicked: {err:#}");
+            }
+        }
+    }
+
+    println!(
+        "output cache: prewarm finished in {:.1}s, {} path(s), {} failure(s)",
+        started.elapsed().as_secs_f64(),
+        path_count,
+        failures
+    );
+}
+
 async fn ensure_nix_cache_info(cache_dir: &Path) -> Result<PathBuf> {
     let path = cache::cache_file_path(cache_dir, "nix-cache-info")?;
     if cache_file_exists(&path).await? {
@@ -286,20 +343,26 @@ async fn ensure_nix_cache_info(cache_dir: &Path) -> Result<PathBuf> {
 }
 
 async fn ensure_cache_entry(cache: &OutputCache, store_path: &nix::StorePath) -> Result<()> {
-    let narinfo_path = cache
-        .dir
-        .join(format!("{}.narinfo", store_path_hash(store_path)));
+    let store_hash = store_path_hash(store_path);
+    let narinfo_path = cache.dir.join(format!("{store_hash}.narinfo"));
     if cache_entry_ready(cache, &narinfo_path).await? {
         println!("output cache: cache hit {}", store_path.as_str());
         return Ok(());
     }
 
-    let _guard = cache.fill_lock.lock().await;
+    let fill_lock = cache.fill_lock(store_hash).await;
+    let _fill_lock = fill_lock.lock().await;
     if cache_entry_ready(cache, &narinfo_path).await? {
         println!("output cache: cache hit {}", store_path.as_str());
         return Ok(());
     }
 
+    let _permit = cache
+        .fill_permits
+        .clone()
+        .acquire_owned()
+        .await
+        .context("cache fill semaphore closed")?;
     remove_stale_narinfo(&narinfo_path).await?;
     tokio::fs::create_dir_all(&cache.dir)
         .await
