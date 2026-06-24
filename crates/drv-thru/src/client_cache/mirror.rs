@@ -23,7 +23,9 @@ use crate::{
 use super::{CacheProgress, FetchedCacheFile, MAX_NARINFO_BYTES, fetch_cache_file};
 
 const MAX_PARALLEL_METADATA_FETCHES: usize = 64;
-const MAX_PARALLEL_NAR_FETCHES: usize = 8;
+const DEFAULT_PARALLEL_NAR_FETCHES: usize = 8;
+const MAX_AUTO_PARALLEL_NAR_FETCHES: usize = 32;
+const NAR_FETCHES_ENV: &str = "DRV_THRU_NAR_FETCHES";
 
 pub(super) struct LocalCacheMirror {
     dir: PathBuf,
@@ -71,7 +73,7 @@ async fn mirror_cache_files(
     progress: CacheProgress,
 ) -> Result<()> {
     let metadata_permits = std::sync::Arc::new(Semaphore::new(MAX_PARALLEL_METADATA_FETCHES));
-    let payload_permits = std::sync::Arc::new(Semaphore::new(MAX_PARALLEL_NAR_FETCHES));
+    let payload_permits = std::sync::Arc::new(Semaphore::new(parallel_nar_fetches()?));
     let mut metadata_tasks = JoinSet::new();
     let mut payload_tasks = JoinSet::new();
 
@@ -225,6 +227,23 @@ async fn write_cache_bytes(dir: &Path, path: &str, bytes: &[u8]) -> Result<()> {
 
 async fn write_nix_cache_info(dir: &Path) -> Result<()> {
     write_cache_bytes(dir, "nix-cache-info", b"StoreDir: /nix/store\n").await
+}
+
+fn parallel_nar_fetches() -> Result<usize> {
+    if let Ok(value) = std::env::var(NAR_FETCHES_ENV) {
+        let parsed = value
+            .parse::<usize>()
+            .with_context(|| format!("parse {NAR_FETCHES_ENV}={value}"))?;
+        if parsed == 0 {
+            bail!("{NAR_FETCHES_ENV} must be at least 1");
+        }
+        return Ok(parsed);
+    }
+
+    Ok(std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(DEFAULT_PARALLEL_NAR_FETCHES)
+        .clamp(DEFAULT_PARALLEL_NAR_FETCHES, MAX_AUTO_PARALLEL_NAR_FETCHES))
 }
 
 fn create_local_cache_dir() -> Result<PathBuf> {

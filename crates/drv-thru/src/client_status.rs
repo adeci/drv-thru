@@ -331,10 +331,7 @@ fn fit_line(line: String) -> String {
         return line;
     }
 
-    let keep = columns.saturating_sub(1);
-    let mut line = line.chars().take(keep).collect::<String>();
-    line.push('…');
-    line
+    line.chars().take(columns).collect()
 }
 
 fn format_elapsed(elapsed: Duration) -> String {
