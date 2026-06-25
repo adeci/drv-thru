@@ -1,5 +1,5 @@
 use std::{
-    io::Write,
+    io::{IsTerminal, Write},
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -19,11 +19,16 @@ pub(super) async fn show(data_dir: Option<PathBuf>, watch: bool) -> Result<()> {
                 server::status::status_path(&data_dir).display()
             )
         })?;
+        if watch && std::io::stdout().is_terminal() {
+            print!("\x1b[2J\x1b[H");
+        }
         print(&snapshot)?;
         if !watch {
             return Ok(());
         }
-        println!();
+        if !std::io::stdout().is_terminal() {
+            println!();
+        }
         std::io::stdout().flush().context("flush status output")?;
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -33,16 +38,14 @@ fn print(snapshot: &server::status::StatusSnapshot) -> Result<()> {
     let now = now_unix_secs()?;
     println!("server: {}", snapshot.server.endpoint_id);
     println!(
-        "builds: active {}/{}, queued {}, recent {}",
+        "builds: active {}/{}, queued {}",
         snapshot.server.active_count,
         snapshot.server.configured_concurrency,
-        snapshot.server.queued_count,
-        snapshot.recent.len()
+        snapshot.server.queued_count
     );
 
-    print_queued(snapshot, now);
     print_active(snapshot, now);
-    print_recent(snapshot);
+    print_queued(snapshot, now);
     Ok(())
 }
 
@@ -80,45 +83,6 @@ fn print_active(snapshot: &server::status::StatusSnapshot, now: u64) {
             format_duration(now.saturating_sub(build.started_at_unix))
         );
     }
-}
-
-fn print_recent(snapshot: &server::status::StatusSnapshot) {
-    if snapshot.recent.is_empty() {
-        return;
-    }
-
-    println!("recent:");
-    for build in &snapshot.recent {
-        let duration = build
-            .duration_seconds
-            .map_or_else(|| "n/a".to_string(), format_duration);
-        let error = build
-            .short_error
-            .as_deref()
-            .map(|error| format!(" - {}", first_line(error)))
-            .unwrap_or_default();
-        println!(
-            "  {} {} {} {} duration {}{}",
-            build.request_id,
-            format_build_result(build.result),
-            build.client_label,
-            build.installable,
-            duration,
-            error
-        );
-    }
-}
-
-fn format_build_result(result: server::status::BuildResult) -> &'static str {
-    match result {
-        server::status::BuildResult::Success => "success",
-        server::status::BuildResult::Failed => "failed",
-        server::status::BuildResult::Error => "error",
-    }
-}
-
-fn first_line(message: &str) -> &str {
-    message.lines().next().unwrap_or(message)
 }
 
 fn format_duration(seconds: u64) -> String {
