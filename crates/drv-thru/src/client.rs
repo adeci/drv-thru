@@ -339,7 +339,10 @@ async fn read_build_messages(
                 }
             }
             Message::BuildFinished(finished) => {
-                if let Err(err) = logs.finish().await {
+                let build_success = finished.success;
+                if let Err(err) = logs.finish().await
+                    && build_success
+                {
                     eprintln!("nom cleanup failed: {err:#}");
                 }
                 status.clear_phase();
@@ -516,7 +519,14 @@ fn print_local_outputs_summary(status: &ClientStatus, installable: &str, output_
 
 fn print_build_summary(status: &ClientStatus, summary: BuildSummary<'_>) {
     status.suspend(|| {
-        println!("drv-thru: build complete");
+        println!(
+            "{}",
+            if summary.build_success {
+                "drv-thru: build complete"
+            } else {
+                "drv-thru: remote build failed"
+            }
+        );
         println!();
         println!("drv-thru -> {}", short_endpoint_id(summary.server_id));
         println!("{:<12} {}", "installable", summary.installable);
@@ -535,7 +545,7 @@ fn print_build_summary(status: &ClientStatus, summary: BuildSummary<'_>) {
             if summary.build_success {
                 "succeeded"
             } else {
-                "failed"
+                "failed; see logs above"
             }
         );
         println!(
