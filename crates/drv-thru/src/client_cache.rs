@@ -106,8 +106,13 @@ async fn import_outputs_from_cache(
     status.phase("checking output import trust");
     let import_method = output_import_method(builder_public_key).await?;
     let progress = status.transfer("mirroring signed output cache");
-    let cache_progress =
-        CacheProgress::new(progress.clone(), closure_paths.len(), copy_paths.len());
+    let nar_fetches = mirror::parallel_nar_fetches(nar_fetches)?;
+    let cache_progress = CacheProgress::new(
+        progress.clone(),
+        closure_paths.len(),
+        copy_paths.len(),
+        nar_fetches,
+    );
     let mirror = mirror::build(
         conn,
         &closure_paths,
@@ -253,10 +258,16 @@ struct CacheProgressState {
     payload_seen: BTreeSet<String>,
     metadata_total: usize,
     payload_total: usize,
+    nar_fetches: usize,
 }
 
 impl CacheProgress {
-    fn new(transfer: TransferProgress, metadata_total: usize, payload_total: usize) -> Self {
+    fn new(
+        transfer: TransferProgress,
+        metadata_total: usize,
+        payload_total: usize,
+        nar_fetches: usize,
+    ) -> Self {
         let progress = Self {
             transfer,
             state: Arc::new(Mutex::new(CacheProgressState {
@@ -264,6 +275,7 @@ impl CacheProgress {
                 payload_seen: BTreeSet::new(),
                 metadata_total,
                 payload_total,
+                nar_fetches,
             })),
         };
         progress.refresh();
@@ -290,9 +302,10 @@ impl CacheProgress {
             return;
         };
         self.transfer.message(format!(
-            "cache metadata {}, payloads {}",
+            "cache metadata {}, payloads {}, nar {}x",
             progress_count(state.metadata_seen.len(), state.metadata_total),
-            progress_count(state.payload_seen.len(), state.payload_total)
+            progress_count(state.payload_seen.len(), state.payload_total),
+            state.nar_fetches
         ));
     }
 }

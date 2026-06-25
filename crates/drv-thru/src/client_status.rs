@@ -118,8 +118,10 @@ impl StatusLine {
     fn transfer(&mut self, message: impl Into<String>, bytes: Arc<AtomicU64>) {
         self.current = Some(Status::Transfer {
             message: message.into(),
-            started: Instant::now(),
             bytes,
+            last_rate: 0,
+            last_rate_bytes: 0,
+            last_rate_at: Instant::now(),
         });
         self.draw_now();
     }
@@ -165,6 +167,7 @@ impl StatusLine {
         if !self.interactive {
             return;
         }
+        self.update_transfer_rate();
         self.clear_line();
         let Some(current) = &self.current else {
             return;
@@ -173,6 +176,30 @@ impl StatusLine {
         let _ = io::stderr().flush();
         self.visible = true;
         self.last_draw = Instant::now();
+    }
+
+    fn update_transfer_rate(&mut self) {
+        let Some(Status::Transfer {
+            bytes,
+            last_rate,
+            last_rate_bytes,
+            last_rate_at,
+            ..
+        }) = &mut self.current
+        else {
+            return;
+        };
+
+        let elapsed = last_rate_at.elapsed();
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+
+        let current = bytes.load(Ordering::Relaxed);
+        let delta = current.saturating_sub(*last_rate_bytes);
+        *last_rate = (delta as f64 / elapsed.as_secs_f64()) as u64;
+        *last_rate_bytes = current;
+        *last_rate_at = Instant::now();
     }
 }
 
@@ -295,8 +322,10 @@ enum Status {
     },
     Transfer {
         message: String,
-        started: Instant,
         bytes: Arc<AtomicU64>,
+        last_rate: u64,
+        last_rate_bytes: u64,
+        last_rate_at: Instant,
     },
 }
 
@@ -313,14 +342,12 @@ impl Status {
             }
             Self::Transfer {
                 message,
-                started,
                 bytes,
+                last_rate,
+                ..
             } => {
-                let bytes = bytes.load(Ordering::Relaxed);
-                let elapsed = started.elapsed();
-                let rate = bytes / elapsed.as_secs().max(1);
-                let bytes = HumanBytes(bytes);
-                let rate = HumanBytes(rate);
+                let bytes = HumanBytes(bytes.load(Ordering::Relaxed));
+                let rate = HumanBytes(*last_rate);
                 if color {
                     format!(
                         "{CYAN_BOLD}drv-thru{RESET}: {message}: {GREEN_BOLD}{bytes}{RESET} ({YELLOW_BOLD}{rate}/s{RESET})"

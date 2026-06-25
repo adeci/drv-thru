@@ -66,6 +66,7 @@ in
 
     client = {
       enable = true;
+      narFetches = null; # auto, based on CPU count; set e.g. 16 to tune
 
       trustedBuilders.leviathan = {
         endpointId = "builder-iroh-endpoint-id";
@@ -113,6 +114,7 @@ in
 
     client = {
       enable = true;
+      narFetches = null; # auto, based on CPU count; set e.g. 16 to tune
       ticketHelper.enable = true;
     };
   };

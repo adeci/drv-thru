@@ -50,7 +50,7 @@ pub(super) async fn build(
     closure_paths: &[nix::StorePath],
     copy_paths: &[nix::StorePath],
     progress: CacheProgress,
-    nar_fetches: Option<usize>,
+    nar_fetches: usize,
 ) -> Result<LocalCacheMirror> {
     let dir = create_local_cache_dir()?;
     write_nix_cache_info(&dir).await?;
@@ -79,10 +79,10 @@ async fn mirror_cache_files(
     closure_paths: &[nix::StorePath],
     copy_narinfos: &BTreeSet<String>,
     progress: CacheProgress,
-    nar_fetches: Option<usize>,
+    nar_fetches: usize,
 ) -> Result<()> {
     let metadata_permits = std::sync::Arc::new(Semaphore::new(MAX_PARALLEL_METADATA_FETCHES));
-    let payload_permits = std::sync::Arc::new(Semaphore::new(parallel_nar_fetches(nar_fetches)?));
+    let payload_permits = std::sync::Arc::new(Semaphore::new(nar_fetches));
     let mut metadata_tasks = JoinSet::new();
     let mut payload_tasks = JoinSet::new();
 
@@ -238,8 +238,11 @@ async fn write_nix_cache_info(dir: &Path) -> Result<()> {
     write_cache_bytes(dir, "nix-cache-info", b"StoreDir: /nix/store\n").await
 }
 
-fn parallel_nar_fetches(configured: Option<usize>) -> Result<usize> {
+pub(super) fn parallel_nar_fetches(configured: Option<usize>) -> Result<usize> {
     if let Some(configured) = configured {
+        if configured == 0 {
+            bail!("--nar-fetches must be at least 1");
+        }
         return Ok(configured);
     }
 

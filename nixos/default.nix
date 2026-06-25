@@ -93,6 +93,12 @@ in
     client = {
       enable = lib.mkEnableOption "drv-thru client CLI";
 
+      narFetches = lib.mkOption {
+        type = lib.types.nullOr lib.types.ints.positive;
+        default = null;
+        description = "Default parallel NAR payload fetches for local cache mirroring. null uses the CLI auto default.";
+      };
+
       trustedBuilders = lib.mkOption {
         default = { };
         description = "Declarative builder signing keys trusted for client-side store imports.";
@@ -148,6 +154,10 @@ in
 
     (lib.mkIf clientCfg.enable {
       environment.systemPackages = [ cfg.package ];
+    })
+
+    (lib.mkIf (clientCfg.enable && clientCfg.narFetches != null) {
+      environment.sessionVariables.DRV_THRU_NAR_FETCHES = toString clientCfg.narFetches;
     })
 
     (lib.mkIf ticketHelperCfg.enable {
