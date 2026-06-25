@@ -227,9 +227,10 @@ fn output_import_setup_error(
         "This client cannot import outputs from this ticket builder.\n\n\
          Nix does not trust this builder key for the current user, and no usable drv-thru import helper is available.\n\
          {helper_status}\n\n\
-         For one-off tickets on normal multi-user NixOS clients, install the helper:\n\n\
-           services.drv-thru.client.enable = true;\n\
-           services.drv-thru.client.ticketHelper.enable = true;\n\
+         On an admin client machine, install the client module; the helper defaults on for wheel users:\n\n\
+           services.drv-thru.client.enable = true;\n\n\
+         For delegated non-admin access, use a narrower helper group:\n\n\
+           services.drv-thru.client.ticketHelper.group = \"drv-thru\";\n\
            users.users.<name>.extraGroups = [ \"drv-thru\" ];\n\n\
          Then rebuild, log out and back in if group membership changed, and retry.\n\n\
          For a persistent trusted builder, add its signing key to:\n\n\
@@ -493,7 +494,8 @@ mod tests {
 
         assert!(err.contains("This client cannot import outputs"));
         assert!(err.contains("No drv-thru import helper socket was found"));
-        assert!(err.contains("services.drv-thru.client.ticketHelper.enable = true"));
+        assert!(err.contains("services.drv-thru.client.enable = true"));
+        assert!(err.contains("services.drv-thru.client.ticketHelper.group = \"drv-thru\""));
         assert!(err.contains("services.drv-thru.client.trustedBuilders.<name>.publicKey"));
         assert!(err.contains("nix run github:adeci/drv-thru#drv-thru"));
     }

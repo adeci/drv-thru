@@ -87,7 +87,7 @@ pub async fn import_paths(socket: &Path, request: ImportRequest) -> Result<()> {
         Err(err) if err.kind() == ErrorKind::PermissionDenied => {
             bail!(
                 "cannot connect to drv-thru import helper at {}: permission denied\n\n\
-                 Add this user to services.drv-thru.client.ticketHelper.group (default: drv-thru), rebuild, log out and back in, then retry.",
+                 Add this user to services.drv-thru.client.ticketHelper.group (default: wheel), rebuild, log out and back in, then retry.",
                 socket.display()
             )
         }

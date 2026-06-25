@@ -127,8 +127,10 @@
       formatter = forAllSystems formatterFor;
 
       nixosModules = {
-        default = ./nixos;
-        drv-thru = ./nixos;
+        default = import ./nixos {
+          packageFor = system: self.packages.${system}.default;
+        };
+        drv-thru = self.nixosModules.default;
       };
     };
 }

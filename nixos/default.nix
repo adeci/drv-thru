@@ -1,3 +1,4 @@
+{ packageFor }:
 {
   config,
   lib,
@@ -9,6 +10,7 @@ let
   serverCfg = cfg.server;
   clientCfg = cfg.client;
   ticketHelperCfg = clientCfg.ticketHelper;
+  package = cfg.package;
   json = pkgs.formats.json { };
 
   serverConfig = json.generate "drv-thru-server.json" {
@@ -30,8 +32,9 @@ in
 {
   options.services.drv-thru = {
     package = lib.mkOption {
-      type = lib.types.nullOr lib.types.package;
-      default = null;
+      type = lib.types.package;
+      default = packageFor pkgs.stdenv.hostPlatform.system;
+      defaultText = lib.literalExpression "inputs.drv-thru.packages.${pkgs.stdenv.hostPlatform.system}.default";
       description = "Package providing the drv-thru binary.";
     };
 
@@ -126,12 +129,17 @@ in
       };
 
       ticketHelper = {
-        enable = lib.mkEnableOption "drv-thru local ticket import helper";
+        enable = lib.mkOption {
+          type = lib.types.bool;
+          default = clientCfg.enable;
+          defaultText = lib.literalExpression "services.drv-thru.client.enable";
+          description = "Whether to run the drv-thru local ticket import helper.";
+        };
 
         group = lib.mkOption {
           type = lib.types.str;
-          default = "drv-thru";
-          description = "Group allowed to use the local drv-thru import helper. Members can import signed store paths from ticket builders.";
+          default = "wheel";
+          description = "Group allowed to use the local drv-thru import helper. Members can import signed store paths from ticket builders. Defaults to wheel because wheel users can already become root; set this to a narrower group for delegated non-admin access.";
         };
       };
     };
@@ -141,9 +149,8 @@ in
     {
       assertions = [
         {
-          assertion =
-            (!serverCfg.enable && !clientCfg.enable && !ticketHelperCfg.enable) || cfg.package != null;
-          message = "services.drv-thru.package must be set when the drv-thru server, client, or client ticket helper is enabled.";
+          assertion = !(ticketHelperCfg.enable && !clientCfg.enable);
+          message = "services.drv-thru.client.ticketHelper.enable requires services.drv-thru.client.enable.";
         }
       ];
     }
@@ -153,7 +160,7 @@ in
     })
 
     (lib.mkIf clientCfg.enable {
-      environment.systemPackages = [ cfg.package ];
+      environment.systemPackages = [ package ];
     })
 
     (lib.mkIf (clientCfg.enable && clientCfg.narFetches != null) {
@@ -170,7 +177,7 @@ in
         after = [ "nix-daemon.service" ];
 
         serviceConfig = {
-          ExecStart = "${lib.getExe cfg.package} import-helper serve --socket /run/drv-thru/import-helper.sock";
+          ExecStart = "${lib.getExe package} import-helper serve --socket /run/drv-thru/import-helper.sock";
           User = "root";
           Group = ticketHelperCfg.group;
           RuntimeDirectory = "drv-thru";
@@ -230,7 +237,7 @@ in
         ];
 
         serviceConfig = {
-          ExecStart = "${lib.getExe cfg.package} serve --config ${serverConfig}";
+          ExecStart = "${lib.getExe package} serve --config ${serverConfig}";
           Restart = "on-failure";
           User = "drv-thru";
           Group = "drv-thru";

@@ -17,25 +17,18 @@ There are three common setups.
 Put this on the machine that will run builds.
 
 ```nix
-{ inputs, pkgs, ... }:
-let
-  drvThru = inputs.drv-thru.packages.${pkgs.stdenv.hostPlatform.system}.default;
-in
+{ inputs, ... }:
 {
   imports = [ inputs.drv-thru.nixosModules.default ];
 
-  services.drv-thru = {
-    package = drvThru;
+  services.drv-thru.server = {
+    enable = true;
 
-    server = {
-      enable = true;
-
-      # Optional long-lived clients. Tickets work without this.
-      trustedClients.alex = {
-        publicKey = "client-iroh-endpoint-id";
-        maxBuildTime = "30m";
-        maxUploadBytes = "20G";
-      };
+    # Optional long-lived clients. Tickets work without this.
+    trustedClients.alex = {
+      publicKey = "client-iroh-endpoint-id";
+      maxBuildTime = "30m";
+      maxUploadBytes = "20G";
     };
   };
 }
@@ -54,25 +47,18 @@ Send the printed ticket to the client.
 Use this when the client should always trust outputs signed by a specific builder.
 
 ```nix
-{ inputs, pkgs, ... }:
-let
-  drvThru = inputs.drv-thru.packages.${pkgs.stdenv.hostPlatform.system}.default;
-in
+{ inputs, ... }:
 {
   imports = [ inputs.drv-thru.nixosModules.default ];
 
-  services.drv-thru = {
-    package = drvThru;
+  services.drv-thru.client = {
+    enable = true;
+    narFetches = null; # auto, based on CPU count; set e.g. 16 to tune
 
-    client = {
-      enable = true;
-      narFetches = null; # auto, based on CPU count; set e.g. 16 to tune
-
-      trustedBuilders.leviathan = {
-        endpointId = "builder-iroh-endpoint-id";
-        publicKey = "drv-thru:builder-signing-public-key";
-        relayUrl = "https://use1-1.relay.n0.iroh.link./";
-      };
+    trustedBuilders.leviathan = {
+      endpointId = "builder-iroh-endpoint-id";
+      publicKey = "drv-thru:builder-signing-public-key";
+      relayUrl = "https://use1-1.relay.n0.iroh.link./";
     };
   };
 }
@@ -102,28 +88,22 @@ drv-thru build nixpkgs#hello \
 Use this when you want to test one-time tickets from arbitrary builders without making the local user a trusted Nix user and without saving builder keys in global Nix config.
 
 ```nix
-{ inputs, pkgs, self, ... }:
-let
-  drvThru = inputs.drv-thru.packages.${pkgs.stdenv.hostPlatform.system}.default;
-in
+{ inputs, ... }:
 {
   imports = [ inputs.drv-thru.nixosModules.default ];
 
-  services.drv-thru = {
-    package = drvThru;
-
-    client = {
-      enable = true;
-      narFetches = null; # auto, based on CPU count; set e.g. 16 to tune
-      ticketHelper.enable = true;
-    };
-  };
-
-  users.users.${self.users.alex.username}.extraGroups = [ "drv-thru" ];
+  services.drv-thru.client.enable = true;
 }
 ```
 
-The helper is a local root service. Its socket is group-gated, so users who should use one-off tickets need to be in `drv-thru` or whatever group you set with `client.ticketHelper.group`.
+The helper defaults on with `client.enable`. It is a local root service. Its socket is group-gated to `wheel` by default, which is appropriate for admin machines because wheel users can already become root.
+
+For delegated non-admin access, use a narrower group:
+
+```nix
+services.drv-thru.client.ticketHelper.group = "drv-thru";
+users.users.alex.extraGroups = [ "drv-thru" ];
+```
 
 After changing groups, log out and back in.
 
@@ -204,7 +184,7 @@ Raw `nix-store --export` / `nix-store --import` is still used for server-side in
 ## Limitations
 
 - Both sides still need Nix. drv-thru moves where the build happens; it is not a Nix daemon replacement.
-- One-off ticket builds for normal NixOS users need the local helper. Without it, Nix will reject unknown builder keys.
+- One-off ticket builds for untrusted Nix users need the local helper. The NixOS client module enables it by default.
 - `client.trustedBuilders.*.endpointId` and `relayUrl` record builder dialing info, but builds still pass `--server`/`--relay-url` or `--ticket` today.
 - First request for a large uncached closure still has to generate cache entries. Later builds reuse the persistent cache.
 - The helper only accepts loopback HTTP cache URLs and exact `/nix/store/...` paths. It does not run arbitrary commands or arbitrary Nix options.
@@ -212,12 +192,10 @@ Raw `nix-store --export` / `nix-store --import` is still used for server-side in
 
 ## NixOS Module Reference
 
-`package` is shared. `server` configures the builder daemon. `client` installs the CLI, trusted builder keys, and the optional local ticket helper.
+`package` defaults automatically from the flake. `server` configures the builder daemon. `client` installs the CLI, trusted builder keys, and the local ticket helper.
 
 ```nix
 services.drv-thru = {
-  package = drvThru;
-
   server = {
     enable = true;
     dataDir = "/var/lib/drv-thru";
@@ -241,9 +219,11 @@ services.drv-thru = {
       relayUrl = null;
     };
 
+    narFetches = null; # auto, based on CPU count; set e.g. 16 to tune
+
     ticketHelper = {
-      enable = true;
-      group = "drv-thru";
+      enable = true; # defaults to client.enable
+      group = "wheel"; # set to "drv-thru" for delegated non-admin users
     };
   };
 };
