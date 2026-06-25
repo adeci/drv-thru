@@ -56,9 +56,7 @@ Use this when the client should always trust outputs signed by a specific builde
     narFetches = null; # auto, based on CPU count; set e.g. 16 to tune
 
     trustedBuilders.leviathan = {
-      endpointId = "builder-iroh-endpoint-id";
       publicKey = "drv-thru:builder-signing-public-key";
-      relayUrl = "https://use1-1.relay.n0.iroh.link./";
     };
   };
 }
@@ -98,7 +96,7 @@ Use this when you want to test one-time tickets from arbitrary builders without 
 
 The helper defaults on with `client.enable`. It is a local root service. Its socket is group-gated to `wheel` by default, which is appropriate for admin machines because wheel users can already become root.
 
-For delegated non-admin access, use a narrower group:
+Important: helper-group membership is local import trust. Members can ask root to import exact signed store paths from loopback drv-thru cache URLs with caller-provided signing keys. Use a narrower group only for users you trust with that power:
 
 ```nix
 services.drv-thru.client.ticketHelper.group = "drv-thru";
@@ -126,6 +124,9 @@ drv-thru ticket create \
   --uses 1 \
   --max-build-time 30m \
   --max-upload-bytes 20G
+
+# Optional: bind the ticket to one client's endpoint id.
+drv-thru ticket create --bind-client "client-iroh-endpoint-id"
 ```
 
 By default, tickets are one-use, expire after 2 hours, allow 30 minutes of build time, and allow 20 GiB of input upload.
@@ -215,7 +216,6 @@ Raw `nix-store --export` / `nix-store --import` is still used for server-side in
 
 - Both sides still need Nix. drv-thru moves where the build happens; it is not a Nix daemon replacement.
 - One-off ticket builds for untrusted Nix users need the local helper. The NixOS client module enables it by default.
-- `client.trustedBuilders.*.endpointId` and `relayUrl` record builder dialing info, but builds still pass `--server`/`--relay-url` or `--ticket` today.
 - First request for a large uncached closure still has to generate cache entries. Later builds reuse the persistent cache.
 - The helper only accepts loopback HTTP cache URLs and exact `/nix/store/...` paths. It does not run arbitrary commands or arbitrary Nix options.
 - Tickets are bearer credentials. Whoever redeems a one-use ticket first gets the build.
@@ -245,16 +245,14 @@ services.drv-thru = {
     enable = true;
 
     trustedBuilders.leviathan = {
-      endpointId = "builder-iroh-endpoint-id";
       publicKey = "drv-thru:builder-signing-public-key";
-      relayUrl = null;
     };
 
     narFetches = null; # auto, based on CPU count; set e.g. 16 to tune
 
     ticketHelper = {
       enable = true; # defaults to client.enable
-      group = "wheel"; # set to "drv-thru" for delegated non-admin users
+      group = "wheel"; # use a narrow group only for trusted local import users
     };
   };
 };

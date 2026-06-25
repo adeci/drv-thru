@@ -1,4 +1,4 @@
-use std::{io::ErrorKind, path::PathBuf};
+use std::{io::ErrorKind, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use tokio::{
@@ -12,6 +12,8 @@ use tokio::{
 use crate::cache;
 
 use super::{HttpMethod, read_http_request, write_http_error, write_http_head};
+
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(super) struct LocalCacheServer {
     url: String,
@@ -61,7 +63,14 @@ async fn run_local_cache_server(
             accepted = listener.accept() => {
                 let (stream, _) = accepted.context("accept local cache HTTP connection")?;
                 let cache_dir = cache_dir.clone();
-                tasks.spawn(async move { handle_local_cache_http(stream, cache_dir).await });
+                tasks.spawn(async move {
+                    tokio::time::timeout(
+                        HTTP_REQUEST_TIMEOUT,
+                        handle_local_cache_http(stream, cache_dir),
+                    )
+                    .await
+                    .context("local cache HTTP request timed out")?
+                });
             }
             result = tasks.join_next(), if !tasks.is_empty() => {
                 if let Some(result) = result {
@@ -74,10 +83,13 @@ async fn run_local_cache_server(
         }
     }
 
+    tasks.abort_all();
     while let Some(result) = tasks.join_next().await {
-        match result.context("local cache HTTP task panicked")? {
-            Ok(()) => {}
-            Err(err) => eprintln!("local cache request failed: {err:#}"),
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => eprintln!("local cache request failed: {err:#}"),
+            Err(err) if err.is_cancelled() => {}
+            Err(err) => return Err(err).context("local cache HTTP task panicked"),
         }
     }
     Ok(())
@@ -97,12 +109,9 @@ async fn handle_local_cache_http(mut stream: TcpStream, cache_dir: PathBuf) -> R
         return Ok(());
     }
 
-    let path = match cache::sanitize_http_cache_path(&request.target) {
-        Ok(path) => path,
-        Err(_) => {
-            write_http_head(&mut stream, 400, 0).await?;
-            return Ok(());
-        }
+    let Ok(path) = cache::sanitize_http_cache_path(&request.target) else {
+        write_http_head(&mut stream, 400, 0).await?;
+        return Ok(());
     };
     let file_path = cache::cache_file_path(&cache_dir, &path)?;
     let metadata = match tokio::fs::metadata(&file_path).await {

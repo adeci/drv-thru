@@ -1,4 +1,33 @@
-use super::*;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
+
+use anyhow::{Context, Result, bail};
+use iroh::endpoint::{Connection, RecvStream, SendStream};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::{Mutex, Semaphore},
+    task::JoinSet,
+};
+
+use crate::{
+    cache, keys, nix,
+    protocol::{
+        CacheFileResponse, Message, OutputCacheReady,
+        path_chunks::{self, PathListKind},
+        wire,
+    },
+};
+
+use super::{
+    CLIENT_NIX_TIMEOUT, CONTROL_TIMEOUT, PATH_LIST_LIMITS, build::store_paths_to_strings,
+    read_message_with_timeout,
+};
 
 const NIX_CACHE_INFO: &[u8] = b"StoreDir: /nix/store\n";
 
@@ -71,17 +100,22 @@ pub(super) async fn export_outputs(
         closure.len(),
         closure_started.elapsed().as_secs_f64()
     );
-    write_path_chunks(
+    path_chunks::write(
         send,
         &store_paths_to_strings(&closure),
         Message::OutputClosure,
     )
     .await?;
 
-    let requested =
-        read_path_chunks_with_timeout(recv, PathListKind::OutputRequest, CLIENT_NIX_TIMEOUT)
-            .await
-            .and_then(|request| requested_output_paths(request, &closure))?;
+    let requested = path_chunks::read_with_timeout(
+        recv,
+        PathListKind::OutputRequest,
+        CLIENT_NIX_TIMEOUT,
+        PATH_LIST_LIMITS,
+        "unexpected path list message",
+    )
+    .await
+    .and_then(|request| requested_output_paths(request, &closure))?;
     println!(
         "output request: {} missing path(s) of {} closure path(s)",
         requested.len(),
@@ -101,7 +135,6 @@ pub(super) async fn export_outputs(
         send,
         &Message::OutputCacheReady(OutputCacheReady {
             copy_paths: store_paths_to_strings(&requested),
-            closure_path_count: closure.len(),
         }),
     )
     .await?;
@@ -349,7 +382,7 @@ async fn ensure_nix_cache_info(cache_dir: &Path) -> Result<PathBuf> {
 }
 
 async fn ensure_cache_entry(cache: &OutputCache, store_path: &nix::StorePath) -> Result<()> {
-    let store_hash = store_path_hash(store_path);
+    let store_hash = store_path.hash();
     let narinfo_path = cache.dir.join(format!("{store_hash}.narinfo"));
     if cache_entry_ready(cache, &narinfo_path).await? {
         println!("output cache: cache hit {}", store_path.as_str());
@@ -433,7 +466,7 @@ async fn cache_file_exists(path: &Path) -> Result<bool> {
 fn output_cache_allowed_paths(paths: &[nix::StorePath]) -> BTreeMap<String, nix::StorePath> {
     paths
         .iter()
-        .map(|path| (store_path_hash(path).to_string(), path.clone()))
+        .map(|path| (path.hash().to_string(), path.clone()))
         .collect()
 }
 
@@ -468,14 +501,6 @@ fn narinfo_signed_by(bytes: &[u8], public_key: &str) -> Result<bool> {
     let signature_prefix = format!("Sig: {name}:");
     let text = std::str::from_utf8(bytes).context("narinfo is not UTF-8")?;
     Ok(text.lines().any(|line| line.starts_with(&signature_prefix)))
-}
-
-fn store_path_hash(path: &nix::StorePath) -> &str {
-    let rest = path
-        .as_str()
-        .strip_prefix("/nix/store/")
-        .expect("StorePath already validated");
-    rest.split_once('-').expect("StorePath already validated").0
 }
 
 async fn write_cache_file_response(

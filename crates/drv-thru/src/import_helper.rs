@@ -151,7 +151,7 @@ async fn handle_connection(mut stream: UnixStream) -> Result<()> {
         },
         Err(err) => ImportResponse {
             success: false,
-            error: Some(truncate_error(err.to_string())),
+            error: Some(truncate_error(&err.to_string())),
         },
     };
     write_json(&mut stream, &response)
@@ -258,8 +258,7 @@ fn valid_base64_byte(byte: u8) -> bool {
 fn public_key_name(public_key: &str) -> &str {
     public_key
         .split_once(':')
-        .map(|(name, _)| name)
-        .unwrap_or("<invalid>")
+        .map_or("<invalid>", |(name, _)| name)
 }
 
 fn remove_stale_socket(socket: &Path) -> Result<()> {
@@ -311,7 +310,7 @@ async fn read_json<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T> {
     serde_json::from_slice(&body).context("decode helper message")
 }
 
-fn truncate_error(message: String) -> String {
+fn truncate_error(message: &str) -> String {
     let mut chars = message.chars();
     let truncated = chars.by_ref().take(MAX_ERROR_CHARS).collect::<String>();
     if chars.next().is_some() {

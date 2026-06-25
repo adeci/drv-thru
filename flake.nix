@@ -64,7 +64,10 @@
 
           meta = {
             description = "Remote Nix builds over Iroh";
-            license = pkgs.lib.licenses.mit;
+            license = with pkgs.lib.licenses; [
+              mit
+              asl20
+            ];
             mainProgram = "drv-thru";
           };
         };
@@ -74,9 +77,11 @@
         treefmt-nix.lib.mkWrapper pkgs {
           projectRootFile = "flake.nix";
 
-          programs.nixfmt.enable = true;
-          programs.rustfmt.enable = true;
-          programs.taplo.enable = true;
+          programs = {
+            nixfmt.enable = true;
+            rustfmt.enable = true;
+            taplo.enable = true;
+          };
 
           settings.global.excludes = [
             ".direnv/*"

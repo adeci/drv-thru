@@ -3,8 +3,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::{Display, Formatter},
-    fs::{self, File},
-    io::{ErrorKind, Write},
+    fs,
+    io::ErrorKind,
     net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
@@ -17,6 +17,8 @@ use anyhow::{Context, Result, bail};
 use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey};
 use iroh_tickets::{ParseError, Ticket};
 use serde::{Deserialize, Serialize};
+
+use crate::{process_lock, state::json};
 
 const TICKETS_FILE: &str = "tickets.json";
 const SERVER_ADDR_FILE: &str = "server-addr.json";
@@ -53,7 +55,7 @@ impl Ticket for BuildTicket {
             node: Variant0NodeAddr {
                 endpoint_id: self.addr.id,
                 relay_url: self.addr.relay_urls().next().cloned(),
-                direct_addrs: self.addr.ip_addrs().cloned().collect(),
+                direct_addrs: self.addr.ip_addrs().copied().collect(),
             },
             secret: self.secret,
         });
@@ -91,7 +93,7 @@ impl FromStr for BuildTicket {
 }
 
 impl BuildTicket {
-    fn generate(addr: EndpointAddr) -> Self {
+    fn generate(addr: &EndpointAddr) -> Self {
         Self {
             addr: compact_ticket_addr(addr),
             secret: SecretKey::generate().to_bytes(),
@@ -136,6 +138,7 @@ pub struct TicketState {
 
 pub struct CreateTicket {
     pub name: Option<String>,
+    pub bound_client: Option<String>,
     pub expires_after: Duration,
     pub uses_remaining: Option<u64>,
     pub max_build_time: String,
@@ -162,7 +165,7 @@ impl TicketStore {
         self.load_unlocked()
     }
 
-    pub fn create(&self, server_addr: EndpointAddr, options: CreateTicket) -> Result<BuildTicket> {
+    pub fn create(&self, server_addr: &EndpointAddr, options: CreateTicket) -> Result<BuildTicket> {
         let _guard = self.lock.lock().expect("ticket store lock poisoned");
         let _file_lock = self.lock_file()?;
         let mut state = self.load_unlocked()?;
@@ -175,6 +178,11 @@ impl TicketStore {
             Some(name) => Some(name),
             None => Some(default_ticket_name(now)),
         };
+        if let Some(bound_client) = &options.bound_client {
+            bound_client
+                .parse::<EndpointId>()
+                .with_context(|| format!("parse bound client endpoint id: {bound_client}"))?;
+        }
 
         let ticket = BuildTicket::generate(server_addr);
         let id = ticket.id();
@@ -189,7 +197,7 @@ impl TicketStore {
                 uses_remaining: options.uses_remaining,
                 max_build_time: options.max_build_time,
                 max_upload_bytes: options.max_upload_bytes,
-                bound_client: None,
+                bound_client: options.bound_client,
                 revoked: false,
             },
         );
@@ -270,7 +278,7 @@ impl TicketStore {
             match create_ticket_store_lock(&lock_path) {
                 Ok(()) => return Ok(TicketFileLock { path: lock_path }),
                 Err(err) if err.kind() == ErrorKind::AlreadyExists => {
-                    remove_stale_ticket_store_lock(&lock_path)?;
+                    remove_stale_ticket_store_lock(&lock_path);
                     thread::sleep(Duration::from_millis(50));
                 }
                 Err(err) => {
@@ -290,7 +298,7 @@ impl TicketStore {
     }
 
     fn write_unlocked(&self, state: &TicketState) -> Result<()> {
-        write_json_atomic(&self.path, state)
+        json::write_atomic_with_mode(&self.path, state, "encode JSON", 0o660)
     }
 }
 
@@ -335,30 +343,26 @@ fn ticket_store_lock_path(path: &Path) -> Result<PathBuf> {
 
 fn create_ticket_store_lock(path: &Path) -> std::io::Result<()> {
     fs::create_dir(path)?;
-    let write_pid = fs::write(path.join("pid"), std::process::id().to_string());
-    if let Err(err) = write_pid {
+    let write_owner = (|| -> std::io::Result<()> {
+        fs::write(path.join("pid"), std::process::id().to_string())?;
+        fs::write(path.join("owner"), process_lock::current_owner_text())
+    })();
+    if let Err(err) = write_owner {
         let _ = fs::remove_dir_all(path);
         return Err(err);
     }
     Ok(())
 }
 
-fn remove_stale_ticket_store_lock(path: &Path) -> Result<()> {
-    let pid_text = fs::read_to_string(path.join("pid")).unwrap_or_default();
-    let Ok(pid) = pid_text.trim().parse::<u32>() else {
-        let _ = fs::remove_dir_all(path);
-        return Ok(());
-    };
-
-    #[cfg(unix)]
-    {
-        if Path::new("/proc").join(pid.to_string()).exists() {
-            return Ok(());
-        }
-        let _ = fs::remove_dir_all(path);
+fn remove_stale_ticket_store_lock(path: &Path) {
+    let owner_text = fs::read_to_string(path.join("owner"))
+        .or_else(|_| fs::read_to_string(path.join("pid")))
+        .unwrap_or_default();
+    if process_lock::owner_is_live(&owner_text) {
+        return;
     }
 
-    Ok(())
+    let _ = fs::remove_dir_all(path);
 }
 
 #[derive(Serialize, Deserialize)]
@@ -404,9 +408,11 @@ impl ServerAddrFile {
 }
 
 pub fn save_server_addr(data_dir: impl AsRef<Path>, addr: &EndpointAddr) -> Result<()> {
-    write_json_atomic(
+    json::write_atomic_with_mode(
         &data_dir.as_ref().join(SERVER_ADDR_FILE),
         &ServerAddrFile::from_addr(addr),
+        "encode JSON",
+        0o660,
     )
 }
 
@@ -435,12 +441,12 @@ pub fn default_ticket_name(unix_secs: u64) -> String {
     format!("ticket-{unix_secs}")
 }
 
-fn compact_ticket_addr(addr: EndpointAddr) -> EndpointAddr {
+fn compact_ticket_addr(addr: &EndpointAddr) -> EndpointAddr {
     let mut compact = EndpointAddr::new(addr.id);
     if let Some(relay_url) = addr.relay_urls().next().cloned() {
         return compact.with_relay_url(relay_url);
     }
-    for direct_addr in addr.ip_addrs().cloned() {
+    for direct_addr in addr.ip_addrs().copied() {
         compact = compact.with_ip_addr(direct_addr);
     }
     compact
@@ -451,61 +457,6 @@ fn now_unix_secs() -> Result<u64> {
         .duration_since(UNIX_EPOCH)
         .context("system clock is before Unix epoch")?
         .as_secs())
-}
-
-fn write_json_atomic<T>(path: &Path, value: &T) -> Result<()>
-where
-    T: Serialize,
-{
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-
-    let mut body = serde_json::to_vec_pretty(value).context("encode JSON")?;
-    body.push(b'\n');
-
-    let tmp_path = temp_path_for(path)?;
-    let write_result = (|| -> Result<()> {
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        let mut file = options
-            .open(&tmp_path)
-            .with_context(|| format!("create {}", tmp_path.display()))?;
-        set_ticket_file_permissions(&file)?;
-        file.write_all(&body)
-            .with_context(|| format!("write {}", tmp_path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("sync {}", tmp_path.display()))?;
-        Ok(())
-    })();
-
-    if let Err(err) = write_result {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(err);
-    }
-
-    fs::rename(&tmp_path, path)
-        .with_context(|| format!("rename {} to {}", tmp_path.display(), path.display()))
-}
-
-fn set_ticket_file_permissions(file: &File) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        file.set_permissions(fs::Permissions::from_mode(0o660))
-            .context("set ticket file permissions")?;
-    }
-
-    Ok(())
-}
-
-fn temp_path_for(path: &Path) -> Result<PathBuf> {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .with_context(|| format!("path has no UTF-8 file name: {}", path.display()))?;
-    Ok(path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id())))
 }
 
 #[cfg(test)]
@@ -535,7 +486,7 @@ mod tests {
         let addr = EndpointAddr::new(SecretKey::generate().public())
             .with_relay_url("https://use1-1.relay.n0.iroh.link./".parse().unwrap())
             .with_ip_addr("127.0.0.1:1234".parse().unwrap());
-        let ticket = BuildTicket::generate(addr);
+        let ticket = BuildTicket::generate(&addr);
 
         assert_eq!(ticket.addr().relay_urls().count(), 1);
         assert_eq!(ticket.addr().ip_addrs().count(), 0);
@@ -548,10 +499,11 @@ mod tests {
         let addr = EndpointAddr::new(SecretKey::generate().public());
         let ticket = store
             .create(
-                addr,
+                &addr,
                 CreateTicket {
                     name: Some("test".to_string()),
-                    expires_after: Duration::from_secs(60),
+                    bound_client: None,
+                    expires_after: Duration::from_mins(1),
                     uses_remaining: Some(1),
                     max_build_time: "30m".to_string(),
                     max_upload_bytes: "20G".to_string(),
@@ -580,10 +532,11 @@ mod tests {
         let addr = EndpointAddr::new(SecretKey::generate().public());
         let ticket = store
             .create(
-                addr,
+                &addr,
                 CreateTicket {
                     name: Some("test".to_string()),
-                    expires_after: Duration::from_secs(60),
+                    bound_client: None,
+                    expires_after: Duration::from_mins(1),
                     uses_remaining: Some(1),
                     max_build_time: "30m".to_string(),
                     max_upload_bytes: "20G".to_string(),
@@ -616,10 +569,11 @@ mod tests {
         let addr = EndpointAddr::new(SecretKey::generate().public());
         let ticket = store
             .create(
-                addr,
+                &addr,
                 CreateTicket {
                     name: Some("test".to_string()),
-                    expires_after: Duration::from_secs(60),
+                    bound_client: None,
+                    expires_after: Duration::from_mins(1),
                     uses_remaining: Some(1),
                     max_build_time: "30m".to_string(),
                     max_upload_bytes: "20G".to_string(),
@@ -637,15 +591,43 @@ mod tests {
     }
 
     #[test]
+    fn ticket_store_enforces_bound_client() {
+        let data_dir = temp_data_dir("bound-client");
+        let store = TicketStore::new(&data_dir);
+        let addr = EndpointAddr::new(SecretKey::generate().public());
+        let bound = SecretKey::generate().public();
+        let other = SecretKey::generate().public();
+        let ticket = store
+            .create(
+                &addr,
+                CreateTicket {
+                    name: Some("test".to_string()),
+                    bound_client: Some(bound.to_string()),
+                    expires_after: Duration::from_mins(1),
+                    uses_remaining: Some(1),
+                    max_build_time: "30m".to_string(),
+                    max_upload_bytes: "20G".to_string(),
+                },
+            )
+            .unwrap();
+
+        assert!(store.check(&ticket.secret(), &bound).is_ok());
+        assert!(store.check(&ticket.secret(), &other).is_err());
+
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
     fn ticket_store_rejects_expired() {
         let data_dir = temp_data_dir("expired");
         let store = TicketStore::new(&data_dir);
         let addr = EndpointAddr::new(SecretKey::generate().public());
         let ticket = store
             .create(
-                addr,
+                &addr,
                 CreateTicket {
                     name: None,
+                    bound_client: None,
                     expires_after: Duration::from_secs(0),
                     uses_remaining: Some(1),
                     max_build_time: "30m".to_string(),

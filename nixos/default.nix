@@ -10,7 +10,7 @@ let
   serverCfg = cfg.server;
   clientCfg = cfg.client;
   ticketHelperCfg = clientCfg.ticketHelper;
-  package = cfg.package;
+  inherit (cfg) package;
   json = pkgs.formats.json { };
 
   serverConfig = json.generate "drv-thru-server.json" {
@@ -115,21 +115,11 @@ in
         type = lib.types.attrsOf (
           lib.types.submodule {
             options = {
-              endpointId = lib.mkOption {
-                type = lib.types.str;
-                description = "Builder Iroh endpoint id.";
-              };
-
               publicKey = lib.mkOption {
                 type = lib.types.str;
                 description = "Builder binary-cache signing public key.";
               };
 
-              relayUrl = lib.mkOption {
-                type = lib.types.nullOr lib.types.str;
-                default = null;
-                description = "Optional builder Iroh relay URL.";
-              };
             };
           }
         );
@@ -146,7 +136,7 @@ in
         group = lib.mkOption {
           type = lib.types.str;
           default = "wheel";
-          description = "Group allowed to use the local drv-thru import helper. Members can import signed store paths from ticket builders. Defaults to wheel because wheel users can already become root; set this to a narrower group for delegated non-admin access.";
+          description = "Group allowed to use the local drv-thru import helper. Members can ask root to import signed store paths from arbitrary loopback drv-thru cache URLs using caller-provided signing keys. Defaults to wheel because wheel users can already become root; use a narrow group only for users trusted with that local import power.";
         };
       };
     };

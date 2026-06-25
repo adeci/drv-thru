@@ -78,7 +78,12 @@ fn valid_nar_file_name(path: &str) -> bool {
     let Some(file_name) = path.rsplit('/').next() else {
         return false;
     };
-    file_name.ends_with(".nar") || file_name.contains(".nar.")
+    matches!(
+        Path::new(file_name)
+            .extension()
+            .and_then(|ext| ext.to_str()),
+        Some("nar")
+    ) || file_name.contains(".nar.")
 }
 
 fn valid_cache_file_char(c: char) -> bool {

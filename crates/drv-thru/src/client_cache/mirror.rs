@@ -257,9 +257,7 @@ pub(super) fn parallel_nar_fetches(configured: Option<usize>) -> Result<usize> {
     }
 
     Ok(auto_parallel_nar_fetches(
-        std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(DEFAULT_PARALLEL_NAR_FETCHES),
+        std::thread::available_parallelism().map_or(DEFAULT_PARALLEL_NAR_FETCHES, usize::from),
     ))
 }
 
@@ -278,15 +276,7 @@ fn create_local_cache_dir() -> Result<PathBuf> {
 }
 
 fn narinfo_path_for_store_path(path: &nix::StorePath) -> String {
-    format!("{}.narinfo", store_path_hash(path))
-}
-
-fn store_path_hash(path: &nix::StorePath) -> &str {
-    let rest = path
-        .as_str()
-        .strip_prefix("/nix/store/")
-        .expect("StorePath already validated");
-    rest.split_once('-').expect("StorePath already validated").0
+    format!("{}.narinfo", path.hash())
 }
 
 #[cfg(test)]

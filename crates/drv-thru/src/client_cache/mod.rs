@@ -18,14 +18,13 @@ use tokio::{
 use crate::{
     client_status::{ClientStatus, TransferProgress},
     import_helper, nix,
-    proto::{CacheFileRequest, CacheFileResponse, Message, OutputCacheReady},
-    wire,
+    protocol::{CacheFileRequest, CacheFileResponse, Message, OutputCacheReady, wire},
 };
 
 use self::local_server::LocalCacheServer;
 
 const CACHE_FILE_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
-const CACHE_FILE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const CACHE_FILE_RESPONSE_TIMEOUT: Duration = Duration::from_mins(30);
 const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
 
 pub(crate) async fn preflight_output_import(public_key: &str) -> Result<()> {
@@ -155,8 +154,7 @@ async fn import_outputs_from_cache(
 
     match (copy_result, server_result.and(mirror_result)) {
         (Ok(()), Ok(())) => Ok(bytes),
-        (Err(err), Ok(())) => Err(err),
-        (Ok(()), Err(err)) => Err(err),
+        (Err(err), Ok(())) | (Ok(()), Err(err)) => Err(err),
         (Err(copy_err), Err(bridge_err)) if cache_bridge_status_error(&bridge_err) => {
             Err(copy_err).with_context(|| bridge_err.to_string())
         }

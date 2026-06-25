@@ -11,7 +11,7 @@ use tokio::{
     process::Command,
 };
 
-use crate::proto::OutputMode;
+use crate::protocol::OutputMode;
 
 const STORE_PREFIX: &str = "/nix/store/";
 const HASH_LEN: usize = 32;
@@ -42,6 +42,14 @@ impl StorePath {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn hash(&self) -> &str {
+        let rest = self
+            .0
+            .strip_prefix(STORE_PREFIX)
+            .expect("StorePath already validated");
+        rest.split_once('-').expect("StorePath already validated").0
     }
 }
 
@@ -400,10 +408,7 @@ async fn current_group_names() -> Result<BTreeSet<String>> {
     let groups = run_command("id", &["-Gn"])
         .await
         .context("read current groups")?;
-    Ok(groups
-        .split_whitespace()
-        .map(|group| group.to_string())
-        .collect())
+    Ok(groups.split_whitespace().map(ToString::to_string).collect())
 }
 
 async fn nix_config_values(option: &str) -> Result<BTreeSet<String>> {
@@ -805,7 +810,7 @@ mod tests {
     }
 
     fn set(values: &[&str]) -> BTreeSet<String> {
-        values.iter().map(|value| value.to_string()).collect()
+        values.iter().map(ToString::to_string).collect()
     }
 
     #[test]

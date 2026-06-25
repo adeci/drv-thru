@@ -200,7 +200,8 @@ impl StatusLine {
 
         let current = bytes.load(Ordering::Relaxed);
         let delta = current.saturating_sub(*last_rate_bytes);
-        *last_rate = (delta as f64 / elapsed.as_secs_f64()) as u64;
+        let elapsed_millis = elapsed.as_millis();
+        *last_rate = u64::try_from(u128::from(delta) * 1000 / elapsed_millis).unwrap_or(u64::MAX);
         *last_rate_bytes = current;
         *last_rate_at = Instant::now();
     }

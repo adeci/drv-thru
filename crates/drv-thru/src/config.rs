@@ -40,10 +40,12 @@ pub struct TrustedClient {
     pub max_upload_bytes: Option<String>,
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn default_max_build_time() -> Option<String> {
     Some(DEFAULT_MAX_BUILD_TIME.to_string())
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn default_max_upload_bytes() -> Option<String> {
     Some(DEFAULT_MAX_UPLOAD_BYTES.to_string())
 }
@@ -256,8 +258,8 @@ mod tests {
     #[test]
     fn parses_durations() {
         assert_eq!(parse_duration("1").unwrap(), Duration::from_secs(1));
-        assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
-        assert_eq!(parse_duration("3h").unwrap(), Duration::from_secs(10_800));
+        assert_eq!(parse_duration("2m").unwrap(), Duration::from_mins(2));
+        assert_eq!(parse_duration("3h").unwrap(), Duration::from_hours(3));
         assert!(parse_duration("1d").is_err());
     }
 }

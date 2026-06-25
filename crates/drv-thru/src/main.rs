@@ -8,10 +8,11 @@ mod config;
 mod import_helper;
 mod keys;
 mod nix;
-mod proto;
+mod process_lock;
+mod protocol;
 mod server;
+mod state;
 mod ticket;
-mod wire;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

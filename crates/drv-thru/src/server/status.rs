@@ -1,6 +1,5 @@
 use std::{
     fs,
-    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -8,6 +7,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::state::json;
 
 pub const STATUS_FILE: &str = "status.json";
 
@@ -266,7 +267,7 @@ impl StatusRegistry {
             let mut state = self.inner.state.lock().expect("status lock poisoned");
             let result = update(&mut state, now);
             refresh_snapshot(&mut state.snapshot, now);
-            write_json_atomic(&self.inner.path, &state.snapshot)?;
+            json::write_atomic(&self.inner.path, &state.snapshot, "encode status JSON")?;
             Ok(result)
         })();
 
@@ -283,7 +284,7 @@ impl StatusRegistry {
         let now = now_unix_secs()?;
         let mut state = self.inner.state.lock().expect("status lock poisoned");
         refresh_snapshot(&mut state.snapshot, now);
-        write_json_atomic(&self.inner.path, &state.snapshot)
+        json::write_atomic(&self.inner.path, &state.snapshot, "encode status JSON")
     }
 }
 
@@ -331,49 +332,6 @@ fn now_unix_secs() -> Result<u64> {
         .duration_since(UNIX_EPOCH)
         .context("system clock is before Unix epoch")?
         .as_secs())
-}
-
-fn write_json_atomic<T>(path: &Path, value: &T) -> Result<()>
-where
-    T: Serialize,
-{
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-
-    let mut body = serde_json::to_vec_pretty(value).context("encode status JSON")?;
-    body.push(b'\n');
-
-    let tmp_path = temp_path_for(path)?;
-    let write_result = (|| -> Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)
-            .with_context(|| format!("create {}", tmp_path.display()))?;
-        file.write_all(&body)
-            .with_context(|| format!("write {}", tmp_path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("sync {}", tmp_path.display()))?;
-        Ok(())
-    })();
-
-    if let Err(err) = write_result {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(err);
-    }
-
-    fs::rename(&tmp_path, path)
-        .with_context(|| format!("rename {} to {}", tmp_path.display(), path.display()))
-}
-
-fn temp_path_for(path: &Path) -> Result<PathBuf> {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .with_context(|| format!("path has no UTF-8 file name: {}", path.display()))?;
-    Ok(path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id())))
 }
 
 #[cfg(test)]

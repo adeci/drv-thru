@@ -10,6 +10,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use iroh::SecretKey;
 
+use crate::process_lock;
+
 pub struct SigningKey {
     pub secret_path: PathBuf,
     pub public_key: String,
@@ -185,7 +187,7 @@ fn create_key_file_lock(path: &Path) -> std::io::Result<()> {
     // Unix symlinks let us create the lock and store the owner PID atomically.
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(std::process::id().to_string(), path)
+        std::os::unix::fs::symlink(process_lock::current_owner_text(), path)
     }
 
     #[cfg(not(unix))]
@@ -197,14 +199,11 @@ fn create_key_file_lock(path: &Path) -> std::io::Result<()> {
 fn remove_stale_key_file_lock(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        let pid_text = match fs::read_link(path) {
-            Ok(pid) => pid.to_string_lossy().into_owned(),
+        let owner_text = match fs::read_link(path) {
+            Ok(owner) => owner.to_string_lossy().into_owned(),
             Err(_) => fs::read_to_string(path.join("pid")).unwrap_or_default(),
         };
-        let Ok(pid) = pid_text.trim().parse::<u32>() else {
-            return remove_key_file_lock(path);
-        };
-        if Path::new("/proc").join(pid.to_string()).exists() {
+        if process_lock::owner_is_live(&owner_text) {
             return Ok(());
         }
         remove_key_file_lock(path)?;
