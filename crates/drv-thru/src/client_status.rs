@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use console::Term;
 use indicatif::HumanBytes;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -18,6 +19,8 @@ const DIM: &str = "\x1b[2m";
 const CYAN_BOLD: &str = "\x1b[1;36m";
 const GREEN_BOLD: &str = "\x1b[1;32m";
 const YELLOW_BOLD: &str = "\x1b[1;33m";
+const DEFAULT_STATUS_COLUMNS: usize = 72;
+const STATUS_RIGHT_MARGIN: usize = 2;
 
 pub struct ClientStatus {
     inner: Arc<Mutex<StatusLine>>,
@@ -361,17 +364,29 @@ impl Status {
 }
 
 fn fit_line(line: String) -> String {
-    let columns = std::env::var("COLUMNS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(80)
-        .saturating_sub(1);
-
+    let columns = status_columns();
     if visible_width(&line) <= columns {
         return line;
     }
 
     truncate_visible(&line, columns)
+}
+
+fn status_columns() -> usize {
+    terminal_columns()
+        .or_else(columns_env)
+        .unwrap_or(DEFAULT_STATUS_COLUMNS)
+        .saturating_sub(STATUS_RIGHT_MARGIN)
+}
+
+fn terminal_columns() -> Option<usize> {
+    let (_rows, columns) = Term::stderr().size_checked()?;
+    (columns > 0).then_some(columns as usize)
+}
+
+fn columns_env() -> Option<usize> {
+    let columns = std::env::var("COLUMNS").ok()?.parse::<usize>().ok()?;
+    (columns > 0).then_some(columns)
 }
 
 fn visible_width(line: &str) -> usize {
@@ -431,5 +446,26 @@ fn format_elapsed(elapsed: Duration) -> String {
         format!("{hours}:{minutes:02}:{seconds:02}")
     } else {
         format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_width_ignores_ansi_escapes() {
+        let line = format!("{CYAN_BOLD}drv-thru{RESET}: building");
+
+        assert_eq!(visible_width(&line), "drv-thru: building".len());
+    }
+
+    #[test]
+    fn truncate_visible_preserves_color_reset() {
+        let line = format!("{CYAN_BOLD}abcdef{RESET}");
+        let truncated = truncate_visible(&line, 3);
+
+        assert_eq!(visible_width(&truncated), 3);
+        assert!(truncated.ends_with(RESET));
     }
 }
