@@ -22,8 +22,8 @@ use crate::{
     access::AccessPolicy,
     cache,
     config::{
-        DEFAULT_MAX_CONCURRENT_BUILDS, MAX_AUTO_CACHE_FILLS, load_server_config, parse_byte_count,
-        parse_duration,
+        DEFAULT_MAX_CONCURRENT_BUILDS, DEFAULT_RECENT_BUILDS_LIMIT, MAX_AUTO_CACHE_FILLS,
+        load_server_config, parse_byte_count, parse_duration,
     },
     keys, nix,
     proto::{
@@ -35,6 +35,7 @@ use crate::{
 };
 
 mod output_cache;
+pub(crate) mod status;
 
 const PATH_CHUNK_SIZE: usize = 512;
 
@@ -59,6 +60,7 @@ pub enum ServeMode {
 }
 
 struct CheckedBuildRequest {
+    installable: String,
     drv_path: nix::StorePath,
     output_mode: OutputMode,
     closure_paths: Vec<nix::StorePath>,
@@ -71,9 +73,15 @@ struct FinishedBuild {
 }
 
 struct AuthorizedConnection {
+    client_label: String,
     max_build_time: Option<Duration>,
     max_upload_bytes: Option<u64>,
     ticket_secret: Option<[u8; 32]>,
+}
+
+struct BuildStatusScope<'a> {
+    registry: &'a status::StatusRegistry,
+    request_id: &'a str,
 }
 
 pub async fn serve(mode: ServeMode) -> Result<()> {
@@ -83,6 +91,7 @@ pub async fn serve(mode: ServeMode) -> Result<()> {
         access_policy,
         max_concurrent_builds,
         output_cache_max_parallel_fills,
+        recent_builds_limit,
     ) = match mode {
         ServeMode::DataDir {
             data_dir,
@@ -93,6 +102,7 @@ pub async fn serve(mode: ServeMode) -> Result<()> {
             AccessPolicy::from_endpoint_ids(trusted_clients),
             DEFAULT_MAX_CONCURRENT_BUILDS,
             None,
+            DEFAULT_RECENT_BUILDS_LIMIT,
         ),
         ServeMode::Config(path) => {
             let config = load_server_config(&path)?;
@@ -103,6 +113,7 @@ pub async fn serve(mode: ServeMode) -> Result<()> {
                 access_policy,
                 config.max_concurrent_builds,
                 config.output_cache_max_parallel_fills,
+                config.recent_builds_limit,
             )
         }
     };
@@ -136,6 +147,13 @@ pub async fn serve(mode: ServeMode) -> Result<()> {
     }
     ticket::save_server_addr(&data_dir, &addr)?;
 
+    let status = status::StatusRegistry::new(
+        &data_dir,
+        endpoint.id().to_string(),
+        max_concurrent_builds,
+        recent_builds_limit,
+    )?;
+    let status_heartbeat = tokio::spawn(status.clone().heartbeat());
     let ticket_store = TicketStore::new(&data_dir);
     ticket_store.load()?;
     let build_queue = Arc::new(Semaphore::new(max_concurrent_builds));
@@ -149,6 +167,7 @@ pub async fn serve(mode: ServeMode) -> Result<()> {
                 let ticket_store = ticket_store.clone();
                 let build_queue = build_queue.clone();
                 let output_cache = output_cache.clone();
+                let status = status.clone();
                 tokio::spawn(async move {
                     let conn = match incoming.await {
                         Ok(conn) => conn,
@@ -158,7 +177,7 @@ pub async fn serve(mode: ServeMode) -> Result<()> {
                         }
                     };
 
-                    if let Err(err) = handle_incoming(conn, access_policy, ticket_store, build_queue, output_cache).await {
+                    if let Err(err) = handle_incoming(conn, access_policy, ticket_store, build_queue, output_cache, status).await {
                         eprintln!("connection error: {err:#}");
                     }
                 });
@@ -166,6 +185,7 @@ pub async fn serve(mode: ServeMode) -> Result<()> {
         }
     }
 
+    status_heartbeat.abort();
     endpoint.close().await;
     Ok(())
 }
@@ -176,6 +196,7 @@ async fn handle_incoming(
     ticket_store: TicketStore,
     build_queue: Arc<Semaphore>,
     output_cache: Arc<output_cache::OutputCache>,
+    status_registry: status::StatusRegistry,
 ) -> Result<()> {
     let peer = conn.remote_id();
     let (mut send, mut recv) = conn.accept_bi().await?;
@@ -242,18 +263,33 @@ async fn handle_incoming(
         return Ok(());
     };
 
-    wire::write_json(&mut send, &Message::BuildQueued).await?;
+    let request_id =
+        status_registry.enqueue(authorized.client_label.clone(), build.installable.clone());
+    if let Err(err) = wire::write_json(&mut send, &Message::BuildQueued).await {
+        status_registry.finish(
+            &request_id,
+            status::BuildResult::Error,
+            Some(err.to_string()),
+        );
+        return Err(err);
+    }
 
     let build_result = {
         let _permit = match build_queue.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => {
+                status_registry.finish(
+                    &request_id,
+                    status::BuildResult::Error,
+                    Some("build queue is closed".to_string()),
+                );
                 send_error(&mut send, "build queue is closed").await?;
                 send.finish()?;
                 wait_closed(&conn).await;
                 return Ok(());
             }
         };
+        status_registry.start(&request_id);
         run_queued_build(
             &conn,
             &mut send,
@@ -261,12 +297,30 @@ async fn handle_incoming(
             build,
             authorized,
             output_cache.as_ref(),
+            BuildStatusScope {
+                registry: &status_registry,
+                request_id: &request_id,
+            },
         )
         .await
     };
 
-    if let Err(err) = build_result {
-        send_error(&mut send, &err.to_string()).await?;
+    match build_result {
+        Ok(true) => status_registry.finish(&request_id, status::BuildResult::Success, None),
+        Ok(false) => status_registry.finish(
+            &request_id,
+            status::BuildResult::Failed,
+            Some("nix build failed".to_string()),
+        ),
+        Err(err) => {
+            let message = err.to_string();
+            status_registry.finish(
+                &request_id,
+                status::BuildResult::Error,
+                Some(message.clone()),
+            );
+            send_error(&mut send, &message).await?;
+        }
     }
     send.finish()?;
 
@@ -325,16 +379,24 @@ async fn authorize_trusted_client(
         .map(parse_byte_count)
         .transpose()?;
 
+    let client_name = client.name.clone();
+    let client_label = client
+        .name
+        .as_deref()
+        .map(|name| format!("client:{name}"))
+        .unwrap_or_else(|| format!("client:{peer}"));
+
     wire::write_json(
         send,
         &Message::AuthOk(AuthOk {
-            client_name: client.name,
+            client_name,
             builder_public_key: builder_public_key.to_string(),
         }),
     )
     .await?;
 
     Ok(Some(AuthorizedConnection {
+        client_label,
         max_build_time,
         max_upload_bytes,
         ticket_secret: None,
@@ -364,16 +426,24 @@ async fn authorize_ticket(
     let max_build_time = Some(parse_duration(&record.max_build_time)?);
     let max_upload_bytes = Some(parse_byte_count(&record.max_upload_bytes)?);
 
+    let client_name = record.name.clone();
+    let client_label = record
+        .name
+        .as_deref()
+        .map(|name| format!("ticket:{name}"))
+        .unwrap_or_else(|| format!("ticket:{peer}"));
+
     wire::write_json(
         send,
         &Message::AuthOk(AuthOk {
-            client_name: record.name,
+            client_name,
             builder_public_key: builder_public_key.to_string(),
         }),
     )
     .await?;
 
     Ok(Some(AuthorizedConnection {
+        client_label,
         max_build_time,
         max_upload_bytes,
         ticket_secret: Some(*secret),
@@ -432,6 +502,7 @@ fn handle_build_request(
     }
 
     Ok(CheckedBuildRequest {
+        installable: request.installable,
         drv_path,
         output_mode: request.output_mode,
         closure_paths,
@@ -446,7 +517,9 @@ async fn run_queued_build(
     build: CheckedBuildRequest,
     authorized: AuthorizedConnection,
     output_cache: &output_cache::OutputCache,
-) -> Result<()> {
+    status: BuildStatusScope<'_>,
+) -> Result<bool> {
+    status.registry.phase(status.request_id, "checking inputs");
     let missing_paths = nix::missing_paths(&build.closure_paths).await?;
     println!(
         "drv path: {}, checked paths: {}, missing paths: {}",
@@ -463,9 +536,11 @@ async fn run_queued_build(
     .await?;
 
     if !missing_paths.is_empty() {
+        status.registry.phase(status.request_id, "uploading inputs");
         import_missing_inputs(conn, send, &missing_paths, authorized.max_upload_bytes).await?;
     }
 
+    status.registry.phase(status.request_id, "building");
     let finished = run_build(
         send,
         &build.drv_path,
@@ -475,11 +550,14 @@ async fn run_queued_build(
     )
     .await?;
     if finished.success {
+        status
+            .registry
+            .phase(status.request_id, "serving output cache");
         output_cache::export_outputs(conn, send, recv, &finished.output_paths, output_cache)
             .await?;
     }
 
-    Ok(())
+    Ok(finished.success)
 }
 
 async fn run_build(

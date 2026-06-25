@@ -136,6 +136,13 @@ Inspect a ticket:
 drv-thru ticket inspect "drvthru..."
 ```
 
+Show local builder status:
+
+```sh
+drv-thru status
+drv-thru status --watch
+```
+
 Build with a ticket:
 
 ```sh
@@ -202,6 +209,7 @@ services.drv-thru = {
     secretKeyFile = "/var/lib/drv-thru/secret.key";
     maxConcurrentBuilds = 1;
     outputCacheMaxParallelFills = null; # auto, based on CPU count; set e.g. 8 to tune
+    recentBuildsLimit = 20;
 
     trustedClients.alex = {
       publicKey = "client-iroh-endpoint-id";

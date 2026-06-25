@@ -18,6 +18,7 @@ let
     secret_key_file = serverCfg.secretKeyFile;
     max_concurrent_builds = serverCfg.maxConcurrentBuilds;
     output_cache_max_parallel_fills = serverCfg.outputCacheMaxParallelFills;
+    recent_builds_limit = serverCfg.recentBuildsLimit;
     trusted_clients = lib.mapAttrs (_: client: {
       public_key = client.publicKey;
       max_build_time = client.maxBuildTime;
@@ -63,6 +64,12 @@ in
         type = lib.types.nullOr lib.types.ints.positive;
         default = null;
         description = "Maximum signed cache entries generated in parallel. null uses an automatic CPU-based default.";
+      };
+
+      recentBuildsLimit = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 20;
+        description = "Maximum recent builds retained in the local drv-thru status snapshot.";
       };
 
       trustedClients = lib.mkOption {
@@ -218,7 +225,7 @@ in
           chmod 0644 ${serverCfg.dataDir}/signing-public.key
         fi
 
-        for file in ${serverCfg.dataDir}/server-addr.json ${serverCfg.dataDir}/tickets.json; do
+        for file in ${serverCfg.dataDir}/server-addr.json ${serverCfg.dataDir}/tickets.json ${serverCfg.dataDir}/status.json; do
           if [ -e "$file" ]; then
             chown drv-thru:wheel "$file"
             chmod 0660 "$file"

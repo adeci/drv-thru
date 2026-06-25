@@ -117,6 +117,7 @@ mod tests {
             secret_key_file: None,
             max_concurrent_builds: 1,
             output_cache_max_parallel_fills: None,
+            recent_builds_limit: crate::config::DEFAULT_RECENT_BUILDS_LIMIT,
             trusted_clients,
         }
     }

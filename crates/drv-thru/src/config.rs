@@ -11,6 +11,7 @@ use serde::Deserialize;
 pub const DEFAULT_MAX_BUILD_TIME: &str = "30m";
 pub const DEFAULT_MAX_UPLOAD_BYTES: &str = "20G";
 pub const DEFAULT_MAX_CONCURRENT_BUILDS: usize = 1;
+pub const DEFAULT_RECENT_BUILDS_LIMIT: usize = 20;
 pub const MAX_AUTO_CACHE_FILLS: usize = 16;
 
 #[derive(Deserialize)]
@@ -23,6 +24,8 @@ pub struct ServerConfig {
     pub max_concurrent_builds: usize,
     #[serde(default)]
     pub output_cache_max_parallel_fills: Option<usize>,
+    #[serde(default = "default_recent_builds_limit")]
+    pub recent_builds_limit: usize,
     #[serde(default)]
     pub trusted_clients: BTreeMap<String, TrustedClient>,
 }
@@ -49,6 +52,10 @@ fn default_max_concurrent_builds() -> usize {
     DEFAULT_MAX_CONCURRENT_BUILDS
 }
 
+fn default_recent_builds_limit() -> usize {
+    DEFAULT_RECENT_BUILDS_LIMIT
+}
+
 pub fn load_server_config(path: impl AsRef<Path>) -> Result<ServerConfig> {
     let path = path.as_ref();
     let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
@@ -59,6 +66,9 @@ pub fn load_server_config(path: impl AsRef<Path>) -> Result<ServerConfig> {
     }
     if config.output_cache_max_parallel_fills == Some(0) {
         bail!("output_cache_max_parallel_fills must be at least 1");
+    }
+    if config.recent_builds_limit == 0 {
+        bail!("recent_builds_limit must be at least 1");
     }
     Ok(config)
 }
@@ -127,6 +137,7 @@ mod tests {
         assert!(config.secret_key_file.is_none());
         assert_eq!(config.max_concurrent_builds, DEFAULT_MAX_CONCURRENT_BUILDS);
         assert_eq!(config.output_cache_max_parallel_fills, None);
+        assert_eq!(config.recent_builds_limit, DEFAULT_RECENT_BUILDS_LIMIT);
         assert!(config.trusted_clients.is_empty());
     }
 
@@ -191,6 +202,15 @@ mod tests {
     }
 
     #[test]
+    fn server_config_accepts_recent_builds_limit() {
+        let config: ServerConfig =
+            serde_json::from_str(r#"{"data_dir":"/tmp/drv-thru","recent_builds_limit":5}"#)
+                .unwrap();
+
+        assert_eq!(config.recent_builds_limit, 5);
+    }
+
+    #[test]
     fn load_server_config_rejects_zero_output_cache_max_parallel_fills() {
         let path = std::env::temp_dir().join(format!(
             "drv-thru-zero-output-cache-max-parallel-fills-{}.json",
@@ -199,6 +219,23 @@ mod tests {
         fs::write(
             &path,
             r#"{"data_dir":"/tmp/drv-thru","output_cache_max_parallel_fills":0}"#,
+        )
+        .unwrap();
+
+        assert!(load_server_config(&path).is_err());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_server_config_rejects_zero_recent_builds_limit() {
+        let path = std::env::temp_dir().join(format!(
+            "drv-thru-zero-recent-builds-limit-{}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"{"data_dir":"/tmp/drv-thru","recent_builds_limit":0}"#,
         )
         .unwrap();
 
