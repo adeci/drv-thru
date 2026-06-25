@@ -101,6 +101,8 @@ enum ImportHelperCommand {
     Serve {
         #[arg(long)]
         socket: PathBuf,
+        #[arg(long = "trusted-public-key-file")]
+        trusted_public_key_file: PathBuf,
     },
 }
 
@@ -153,9 +155,16 @@ async fn dispatch(command: Command) -> Result<()> {
         }
         Command::Ticket { command } => tickets::run(command),
         Command::Status { data_dir, watch } => status::show(data_dir, watch).await,
-        Command::ImportHelper {
-            command: ImportHelperCommand::Serve { socket },
-        } => import_helper::serve(socket).await,
+        Command::ImportHelper { command } => match command {
+            ImportHelperCommand::Serve {
+                socket,
+                trusted_public_key_file,
+            } => {
+                let trusted_public_keys =
+                    import_helper::load_trusted_public_keys(&trusted_public_key_file)?;
+                import_helper::serve(socket, trusted_public_keys).await
+            }
+        },
     }
 }
 

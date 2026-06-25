@@ -227,6 +227,8 @@ fn output_import_setup_error(
          {helper_status}\n\n\
          On an admin client machine, install the client module; the helper defaults on for wheel users:\n\n\
            services.drv-thru.client.enable = true;\n\n\
+         For ticket-helper imports, allow the builder signing key locally:\n\n\
+           services.drv-thru.client.ticketHelper.trustedBuilderPublicKeys = [ \"<builder-public-key>\" ];\n\n\
          For delegated non-admin access, use a narrower helper group:\n\n\
            services.drv-thru.client.ticketHelper.group = \"drv-thru\";\n\
            users.users.<name>.extraGroups = [ \"drv-thru\" ];\n\n\

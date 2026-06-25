@@ -1,7 +1,9 @@
 use std::{
+    collections::BTreeSet,
     io::ErrorKind,
     os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
@@ -37,7 +39,7 @@ struct ValidatedImportRequest {
     paths: Vec<StorePath>,
 }
 
-pub async fn serve(socket: PathBuf) -> Result<()> {
+pub async fn serve(socket: PathBuf, trusted_public_keys: BTreeSet<String>) -> Result<()> {
     if let Some(parent) = socket.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             format!("create import helper socket directory {}", parent.display())
@@ -49,13 +51,22 @@ pub async fn serve(socket: PathBuf) -> Result<()> {
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o770))
         .with_context(|| format!("chmod import helper socket {}", socket.display()))?;
 
+    let trusted_public_keys = Arc::new(trusted_public_keys);
+    eprintln!(
+        "drv-thru import-helper: listening on {} with {} trusted builder key(s): {}",
+        socket.display(),
+        trusted_public_keys.len(),
+        public_key_names(&trusted_public_keys)
+    );
+
     loop {
         let (stream, _) = listener
             .accept()
             .await
             .context("accept import helper connection")?;
+        let trusted_public_keys = Arc::clone(&trusted_public_keys);
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream).await {
+            if let Err(err) = handle_connection(stream, trusted_public_keys).await {
                 eprintln!("drv-thru import-helper: {err:#}");
             }
         });
@@ -80,7 +91,7 @@ pub fn helper_socket_status(socket: &Path) -> HelperSocketStatus {
 }
 
 pub async fn import_paths(socket: &Path, request: ImportRequest) -> Result<()> {
-    validate_request(&request)?;
+    validate_request_shape(&request)?;
 
     let mut stream = match UnixStream::connect(socket).await {
         Ok(stream) => stream,
@@ -122,18 +133,23 @@ pub async fn import_paths(socket: &Path, request: ImportRequest) -> Result<()> {
     }
 }
 
-async fn handle_connection(mut stream: UnixStream) -> Result<()> {
+async fn handle_connection(
+    mut stream: UnixStream,
+    trusted_public_keys: Arc<BTreeSet<String>>,
+) -> Result<()> {
     let (uid, gid) = peer_uid_gid(&stream);
     let result = async {
         let request: ImportRequest = read_json(&mut stream).await.context("read request")?;
+        let key_trusted = trusted_public_keys.contains(&request.builder_public_key);
         eprintln!(
-            "drv-thru import-helper: uid={} gid={} builder={} paths={}",
+            "drv-thru import-helper: uid={} gid={} builder={} trusted={} paths={}",
             uid,
             gid,
             public_key_name(&request.builder_public_key),
+            key_trusted,
             request.paths.len()
         );
-        let request = validate_request(&request)?;
+        let request = validate_trusted_request(&request, &trusted_public_keys)?;
         nix::copy_from_signed_binary_cache(
             &request.cache_url,
             &request.builder_public_key,
@@ -159,7 +175,43 @@ async fn handle_connection(mut stream: UnixStream) -> Result<()> {
         .context("write response")
 }
 
-fn validate_request(request: &ImportRequest) -> Result<ValidatedImportRequest> {
+pub fn load_trusted_public_keys(path: &Path) -> Result<BTreeSet<String>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read trusted builder public keys from {}", path.display()))?;
+    let mut keys = BTreeSet::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        validate_nix_public_key(line).with_context(|| {
+            format!(
+                "invalid trusted builder public key at {}:{}",
+                path.display(),
+                index + 1
+            )
+        })?;
+        keys.insert(line.to_string());
+    }
+    Ok(keys)
+}
+
+fn validate_trusted_request(
+    request: &ImportRequest,
+    trusted_public_keys: &BTreeSet<String>,
+) -> Result<ValidatedImportRequest> {
+    let request = validate_request_shape(request)?;
+    if !trusted_public_keys.contains(&request.builder_public_key) {
+        bail!(
+            "builder public key is not allowed by local import helper trust config: {}\n\n\
+             Add this key to services.drv-thru.client.ticketHelper.trustedBuilderPublicKeys, rebuild, log out and back in if group membership changed, then retry.",
+            request.builder_public_key
+        );
+    }
+    Ok(request)
+}
+
+fn validate_request_shape(request: &ImportRequest) -> Result<ValidatedImportRequest> {
     validate_loopback_http_url(&request.cache_url)?;
     validate_nix_public_key(&request.builder_public_key)?;
 
@@ -261,6 +313,18 @@ fn public_key_name(public_key: &str) -> &str {
         .map_or("<invalid>", |(name, _)| name)
 }
 
+fn public_key_names(public_keys: &BTreeSet<String>) -> String {
+    let names = public_keys
+        .iter()
+        .map(|key| public_key_name(key))
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        "<none>".to_string()
+    } else {
+        names.join(",")
+    }
+}
+
 fn remove_stale_socket(socket: &Path) -> Result<()> {
     match std::fs::symlink_metadata(socket) {
         Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(socket)
@@ -325,6 +389,7 @@ mod tests {
     use super::*;
 
     const KEY: &str = "drv-thru-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const OTHER_KEY_SAME_NAME: &str = "drv-thru-1:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=";
     const PATH: &str = "/nix/store/00000000000000000000000000000000-test";
 
     #[test]
@@ -352,33 +417,54 @@ mod tests {
 
     #[test]
     fn accepts_valid_import_request() {
-        validate_request(&valid_request()).unwrap();
+        validate_request_shape(&valid_request()).unwrap();
     }
 
     #[test]
     fn rejects_invalid_import_requests() {
         let mut request = valid_request();
         request.builder_public_key = String::new();
-        assert!(validate_request(&request).is_err());
+        assert!(validate_request_shape(&request).is_err());
 
         let mut request = valid_request();
         request.cache_url = "http://example.com:80".to_string();
-        assert!(validate_request(&request).is_err());
+        assert!(validate_request_shape(&request).is_err());
 
         let mut request = valid_request();
         request.paths.clear();
-        assert!(validate_request(&request).is_err());
+        assert!(validate_request_shape(&request).is_err());
 
         let mut request = valid_request();
         request.paths = vec!["/tmp/nope".to_string()];
-        assert!(validate_request(&request).is_err());
+        assert!(validate_request_shape(&request).is_err());
     }
 
     #[test]
     fn rejects_too_many_import_paths() {
         let mut request = valid_request();
         request.paths = vec![PATH.to_string(); MAX_IMPORT_PATHS + 1];
-        assert!(validate_request(&request).is_err());
+        assert!(validate_request_shape(&request).is_err());
+    }
+
+    #[test]
+    fn accepts_helper_trusted_builder_key() {
+        validate_trusted_request(&valid_request(), &trusted_keys(&[KEY])).unwrap();
+    }
+
+    #[test]
+    fn rejects_builder_key_missing_from_helper_allowlist() {
+        let Err(err) = validate_trusted_request(&valid_request(), &trusted_keys(&[])) else {
+            panic!("accepted untrusted builder key");
+        };
+        assert!(err.to_string().contains("not allowed"));
+    }
+
+    #[test]
+    fn helper_allowlist_matches_full_builder_key() {
+        let mut request = valid_request();
+        request.builder_public_key = OTHER_KEY_SAME_NAME.to_string();
+
+        assert!(validate_trusted_request(&request, &trusted_keys(&[KEY])).is_err());
     }
 
     #[test]
@@ -401,5 +487,9 @@ mod tests {
             cache_url: "http://127.0.0.1:1234".to_string(),
             paths: vec![PATH.to_string()],
         }
+    }
+
+    fn trusted_keys(keys: &[&str]) -> BTreeSet<String> {
+        keys.iter().map(|key| (*key).to_string()).collect()
     }
 }

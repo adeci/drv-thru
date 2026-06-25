@@ -436,7 +436,7 @@ async fn cache_entry_ready(cache: &OutputCache, narinfo_path: &Path) -> Result<b
         Err(err) => return Err(err).with_context(|| format!("read {}", narinfo_path.display())),
     };
 
-    if !narinfo_signed_by(&bytes, &cache.signing_key.public_key)? {
+    if !narinfo_has_signature_name(&bytes, &cache.signing_key.public_key)? {
         return Ok(false);
     }
 
@@ -494,12 +494,14 @@ fn signing_cache_dir_name(public_key: &str) -> String {
     name
 }
 
-fn narinfo_signed_by(bytes: &[u8], public_key: &str) -> Result<bool> {
+fn narinfo_has_signature_name(bytes: &[u8], public_key: &str) -> Result<bool> {
     let Some((name, _)) = public_key.split_once(':') else {
         bail!("invalid signing public key")
     };
     let signature_prefix = format!("Sig: {name}:");
     let text = std::str::from_utf8(bytes).context("narinfo is not UTF-8")?;
+
+    // Readiness only filters stale/mismatched cache entries; Nix verifies the signature body.
     Ok(text.lines().any(|line| line.starts_with(&signature_prefix)))
 }
 
@@ -567,11 +569,18 @@ mod tests {
     }
 
     #[test]
-    fn detects_current_signing_key_in_narinfo() {
+    fn detects_signature_name_in_narinfo() {
         let narinfo = b"Sig: drv-thru:abc
 ";
-        assert!(narinfo_signed_by(narinfo, "drv-thru:public-key").unwrap());
-        assert!(!narinfo_signed_by(narinfo, "other:public-key").unwrap());
+        assert!(narinfo_has_signature_name(narinfo, "drv-thru:public-key").unwrap());
+        assert!(!narinfo_has_signature_name(narinfo, "other:public-key").unwrap());
+    }
+
+    #[test]
+    fn narinfo_readiness_check_does_not_validate_signature_body() {
+        let narinfo = b"Sig: drv-thru:abc
+";
+        assert!(narinfo_has_signature_name(narinfo, "drv-thru:different-key-body").unwrap());
     }
 
     #[test]

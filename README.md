@@ -81,22 +81,27 @@ drv-thru build nixpkgs#hello \
   --relay-url "https://use1-1.relay.n0.iroh.link./"
 ```
 
-### 3. Ticket-Only Client For One-Off Builders
+### 3. Ticket Helper With Local Builder Allowlist
 
-Use this when you want to test one-time tickets from arbitrary builders without making the local user a trusted Nix user and without saving builder keys in global Nix config.
+Use this when you want ticket builds without making the local user a trusted Nix user and without saving builder keys in global Nix config. The helper still needs an explicit local allowlist of builder signing keys.
 
 ```nix
 { inputs, ... }:
 {
   imports = [ inputs.drv-thru.nixosModules.default ];
 
-  services.drv-thru.client.enable = true;
+  services.drv-thru.client = {
+    enable = true;
+    ticketHelper.trustedBuilderPublicKeys = [
+      "drv-thru:builder-signing-public-key"
+    ];
+  };
 }
 ```
 
 The helper defaults on with `client.enable`. It is a local root service. Its socket is group-gated to `wheel` by default, which is appropriate for admin machines because wheel users can already become root.
 
-Important: helper-group membership is local import trust. Members can ask root to import exact signed store paths from loopback drv-thru cache URLs with caller-provided signing keys. Use a narrower group only for users you trust with that power:
+Important: helper-group membership is local import trust for allowed builder keys. Members can ask root to import exact signed store paths from loopback drv-thru cache URLs when the builder signing key is in `ticketHelper.trustedBuilderPublicKeys` or `client.trustedBuilders`. Use a narrower group only for users you trust with that local import power:
 
 ```nix
 services.drv-thru.client.ticketHelper.group = "drv-thru";
@@ -111,7 +116,7 @@ Then build with a ticket:
 drv-thru build nixpkgs#hello --ticket "drvthru..."
 ```
 
-No trusted builder entry is needed for this mode. The helper validates a narrow request and runs trusted `nix copy` locally for exact store paths from a loopback cache URL.
+No `client.trustedBuilders` entry is needed for this mode. The helper validates a narrow request, checks the builder key against its local allowlist, and runs trusted `nix copy` locally for exact store paths from a loopback cache URL.
 
 ## Usage
 
@@ -198,7 +203,7 @@ A ticket alone does not make an untrusted multi-user Nix client accept outputs f
 
 - the local user is a trusted Nix user,
 - the builder signing key is in `nix.settings.trusted-public-keys`, or
-- the local user can access the drv-thru import helper socket.
+- the local user can access the drv-thru import helper socket and the builder key is in the helper allowlist.
 
 ## Output Cache
 
@@ -206,7 +211,7 @@ Outputs are imported through Nix binary-cache semantics:
 
 - signed `.narinfo`
 - matching NAR/NAR.zst file
-- trusted public key, or a trusted local helper doing the import
+- trusted public key, or a trusted local helper with that builder key in its allowlist
 
 The server keeps a persistent signed cache under `/var/lib/drv-thru/cache`. Cache entries are generated on demand when the client asks for allowed `.narinfo` files, then reused across tickets and builds.
 
@@ -215,9 +220,9 @@ Raw `nix-store --export` / `nix-store --import` is still used for server-side in
 ## Limitations
 
 - Both sides still need Nix. drv-thru moves where the build happens; it is not a Nix daemon replacement.
-- One-off ticket builds for untrusted Nix users need the local helper. The NixOS client module enables it by default.
+- One-off ticket builds for untrusted Nix users need the local helper and a helper builder-key allowlist entry. The NixOS client module enables the helper by default.
 - First request for a large uncached closure still has to generate cache entries. Later builds reuse the persistent cache.
-- The helper only accepts loopback HTTP cache URLs and exact `/nix/store/...` paths. It does not run arbitrary commands or arbitrary Nix options.
+- The helper only accepts allowlisted builder keys, loopback HTTP cache URLs, and exact `/nix/store/...` paths. It does not run arbitrary commands or arbitrary Nix options.
 - Tickets are bearer credentials. Whoever redeems a one-use ticket first gets the build.
 
 ## NixOS Module Reference
@@ -253,6 +258,9 @@ services.drv-thru = {
     ticketHelper = {
       enable = true; # defaults to client.enable
       group = "wheel"; # use a narrow group only for trusted local import users
+      trustedBuilderPublicKeys = [
+        "drv-thru:ticket-only-builder-signing-public-key"
+      ];
     };
   };
 };

@@ -143,3 +143,74 @@ fn check_limits(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ReadLimits, ReadState, check_limits};
+    use crate::protocol::PathListChunk;
+
+    #[test]
+    fn rejects_path_list_chunk_count_over_limit() {
+        let limits = ReadLimits {
+            chunks: 1,
+            paths: 10,
+            bytes: 100,
+        };
+        let mut state = ReadState {
+            chunks: 0,
+            path_bytes: 0,
+        };
+        let paths = vec!["/nix/store/00000000000000000000000000000000-a".to_string()];
+
+        check_limits(&[], &chunk(&paths), &mut state, limits).unwrap();
+        let err = check_limits(&paths, &chunk(&paths), &mut state, limits).unwrap_err();
+
+        assert!(err.to_string().contains("path list exceeded 1 chunks"));
+    }
+
+    #[test]
+    fn rejects_path_list_path_count_over_limit() {
+        let limits = ReadLimits {
+            chunks: 10,
+            paths: 1,
+            bytes: 100,
+        };
+        let mut state = ReadState {
+            chunks: 0,
+            path_bytes: 0,
+        };
+        let paths = vec![
+            "/nix/store/00000000000000000000000000000000-a".to_string(),
+            "/nix/store/00000000000000000000000000000000-b".to_string(),
+        ];
+
+        let err = check_limits(&[], &chunk(&paths), &mut state, limits).unwrap_err();
+
+        assert!(err.to_string().contains("path list exceeded 1 paths"));
+    }
+
+    #[test]
+    fn rejects_path_list_byte_count_over_limit() {
+        let limits = ReadLimits {
+            chunks: 10,
+            paths: 10,
+            bytes: 1,
+        };
+        let mut state = ReadState {
+            chunks: 0,
+            path_bytes: 0,
+        };
+        let paths = vec!["/nix/store/00000000000000000000000000000000-a".to_string()];
+
+        let err = check_limits(&[], &chunk(&paths), &mut state, limits).unwrap_err();
+
+        assert!(err.to_string().contains("path list exceeded 1 bytes"));
+    }
+
+    fn chunk(paths: &[String]) -> PathListChunk {
+        PathListChunk {
+            paths: paths.to_vec(),
+            done: false,
+        }
+    }
+}

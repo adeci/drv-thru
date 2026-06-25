@@ -26,9 +26,15 @@ let
     }) serverCfg.trustedClients;
   };
 
-  trustedBuilderPublicKeys = lib.mapAttrsToList (
+  clientTrustedBuilderPublicKeys = lib.mapAttrsToList (
     _: builder: builder.publicKey
   ) clientCfg.trustedBuilders;
+  helperTrustedBuilderPublicKeys = lib.unique (
+    clientTrustedBuilderPublicKeys ++ ticketHelperCfg.trustedBuilderPublicKeys
+  );
+  helperTrustedPublicKeysFile = pkgs.writeText "drv-thru-import-helper-trusted-public-keys" ''
+    ${lib.concatStringsSep "\n" helperTrustedBuilderPublicKeys}
+  '';
 in
 {
   options.services.drv-thru = {
@@ -111,7 +117,7 @@ in
 
       trustedBuilders = lib.mkOption {
         default = { };
-        description = "Declarative builder signing keys trusted for client-side store imports.";
+        description = "Declarative builder signing keys trusted globally for client-side store imports.";
         type = lib.types.attrsOf (
           lib.types.submodule {
             options = {
@@ -136,7 +142,13 @@ in
         group = lib.mkOption {
           type = lib.types.str;
           default = "wheel";
-          description = "Group allowed to use the local drv-thru import helper. Members can ask root to import signed store paths from arbitrary loopback drv-thru cache URLs using caller-provided signing keys. Defaults to wheel because wheel users can already become root; use a narrow group only for users trusted with that local import power.";
+          description = "Group allowed to use the local drv-thru import helper. Members can ask root to import exact signed store paths from loopback drv-thru cache URLs, but only for keys allowed by client.trustedBuilders or ticketHelper.trustedBuilderPublicKeys. Defaults to wheel because wheel users can already become root; use a narrow group only for users trusted with that local import power.";
+        };
+
+        trustedBuilderPublicKeys = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [ ];
+          description = "Additional builder signing public keys the local import helper may trust without adding them to nix.settings.trusted-public-keys. Public keys from client.trustedBuilders are also accepted.";
         };
       };
     };
@@ -152,8 +164,8 @@ in
       ];
     }
 
-    (lib.mkIf (clientCfg.enable && trustedBuilderPublicKeys != [ ]) {
-      nix.settings.trusted-public-keys = lib.mkAfter trustedBuilderPublicKeys;
+    (lib.mkIf (clientCfg.enable && clientTrustedBuilderPublicKeys != [ ]) {
+      nix.settings.trusted-public-keys = lib.mkAfter clientTrustedBuilderPublicKeys;
     })
 
     (lib.mkIf clientCfg.enable {
@@ -174,7 +186,7 @@ in
         after = [ "nix-daemon.service" ];
 
         serviceConfig = {
-          ExecStart = "${lib.getExe package} import-helper serve --socket /run/drv-thru/import-helper.sock";
+          ExecStart = "${lib.getExe package} import-helper serve --socket /run/drv-thru/import-helper.sock --trusted-public-key-file ${helperTrustedPublicKeysFile}";
           User = "root";
           Group = ticketHelperCfg.group;
           RuntimeDirectory = "drv-thru";
