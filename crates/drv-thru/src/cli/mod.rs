@@ -11,6 +11,7 @@ use crate::{
     server, ticket,
 };
 
+mod builders;
 mod data_dir;
 mod status;
 mod tickets;
@@ -39,6 +40,12 @@ enum Command {
     },
     Build {
         installable: String,
+        #[arg(
+            long,
+            value_name = "NAME",
+            help = "Use a named builder from /etc/drv-thru/builders.json."
+        )]
+        builder: Option<String>,
         #[arg(long)]
         server: Option<EndpointId>,
         #[arg(long)]
@@ -122,6 +129,7 @@ async fn dispatch(command: Command) -> Result<()> {
         } => serve(data_dir, config, trusted_client).await,
         Command::Build {
             installable,
+            builder,
             server,
             relay_url,
             ticket,
@@ -140,6 +148,7 @@ async fn dispatch(command: Command) -> Result<()> {
             };
             build(BuildCommandArgs {
                 installable,
+                builder,
                 server,
                 relay_url,
                 ticket,
@@ -206,6 +215,7 @@ async fn serve(
 
 struct BuildCommandArgs {
     installable: String,
+    builder: Option<String>,
     server: Option<EndpointId>,
     relay_url: Option<RelayUrl>,
     ticket: Option<ticket::BuildTicket>,
@@ -222,7 +232,12 @@ async fn build(args: BuildCommandArgs) -> Result<()> {
     if args.nar_fetches == Some(0) {
         bail!("--nar-fetches must be at least 1");
     }
-    let auth = build_auth(args.server, args.relay_url, args.ticket)?;
+    let auth = build_auth(
+        args.builder.as_deref(),
+        args.server,
+        args.relay_url,
+        args.ticket,
+    )?;
     client::build(
         args.installable,
         auth,
@@ -259,10 +274,14 @@ fn eval_options(
 }
 
 fn build_auth(
+    builder: Option<&str>,
     server: Option<EndpointId>,
     relay_url: Option<RelayUrl>,
     ticket: Option<ticket::BuildTicket>,
 ) -> Result<Option<BuildAuth>> {
+    if builder.is_some() && (server.is_some() || relay_url.is_some() || ticket.is_some()) {
+        bail!("--builder cannot be used with --server, --relay-url, or --ticket");
+    }
     if ticket.is_some() && relay_url.is_some() {
         bail!("--relay-url cannot be used with --ticket");
     }
@@ -270,13 +289,15 @@ fn build_auth(
         bail!("--relay-url requires --server");
     }
 
-    match (server, ticket) {
-        (Some(server_id), None) => Ok(Some(BuildAuth::TrustedClient {
+    match (builder, server, ticket) {
+        (Some(name), None, None) => builders::load(name).map(Some),
+        (None, Some(server_id), None) => Ok(Some(BuildAuth::TrustedClient {
             server_id,
             relay_url,
         })),
-        (None, Some(ticket)) => Ok(Some(BuildAuth::Ticket(ticket))),
-        (None, None) => Ok(None),
-        (Some(_), Some(_)) => bail!("--server and --ticket cannot be used together"),
+        (None, None, Some(ticket)) => Ok(Some(BuildAuth::Ticket(ticket))),
+        (None, None, None) => Ok(None),
+        (None, Some(_), Some(_)) => bail!("--server and --ticket cannot be used together"),
+        (Some(_), _, _) => unreachable!("checked above"),
     }
 }

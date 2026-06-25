@@ -26,15 +26,26 @@ let
     }) serverCfg.trustedClients;
   };
 
-  clientTrustedBuilderPublicKeys = lib.mapAttrsToList (
+  standaloneTrustedBuilderPublicKeys = lib.mapAttrsToList (
     _: builder: builder.publicKey
   ) clientCfg.trustedBuilders;
+  namedBuilderPublicKeys = lib.mapAttrsToList (_: builder: builder.publicKey) clientCfg.builders;
+  clientTrustedBuilderPublicKeys = lib.unique (
+    standaloneTrustedBuilderPublicKeys ++ namedBuilderPublicKeys
+  );
   helperTrustedBuilderPublicKeys = lib.unique (
     clientTrustedBuilderPublicKeys ++ ticketHelperCfg.trustedBuilderPublicKeys
   );
   helperTrustedPublicKeysFile = pkgs.writeText "drv-thru-import-helper-trusted-public-keys" ''
     ${lib.concatStringsSep "\n" helperTrustedBuilderPublicKeys}
   '';
+  clientBuildersConfig = json.generate "drv-thru-builders.json" {
+    builders = lib.mapAttrs (_: builder: {
+      endpoint_id = builder.endpointId;
+      endpoint_id_file = builder.endpointIdFile;
+      relay_url = builder.relayUrl;
+    }) clientCfg.builders;
+  };
 in
 {
   options.services.drv-thru = {
@@ -131,6 +142,39 @@ in
         );
       };
 
+      builders = lib.mkOption {
+        default = { };
+        description = "Named long-lived builders available to drv-thru build --builder <name>. These entries also trust the builder signing key globally for client-side store imports.";
+        type = lib.types.attrsOf (
+          lib.types.submodule {
+            options = {
+              endpointId = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                description = "Builder Iroh endpoint id. Use endpointIdFile instead to keep this out of the Nix store and git.";
+              };
+
+              endpointIdFile = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                description = "Runtime file containing the builder Iroh endpoint id. Useful with sops/agenix secrets.";
+              };
+
+              relayUrl = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                description = "Optional Iroh relay URL for this builder.";
+              };
+
+              publicKey = lib.mkOption {
+                type = lib.types.str;
+                description = "Builder binary-cache signing public key.";
+              };
+            };
+          }
+        );
+      };
+
       ticketHelper = {
         enable = lib.mkOption {
           type = lib.types.bool;
@@ -161,11 +205,21 @@ in
           assertion = !(ticketHelperCfg.enable && !clientCfg.enable);
           message = "services.drv-thru.client.ticketHelper.enable requires services.drv-thru.client.enable.";
         }
+        {
+          assertion = lib.all (builder: (builder.endpointId != null) != (builder.endpointIdFile != null)) (
+            lib.attrValues clientCfg.builders
+          );
+          message = "Each services.drv-thru.client.builders entry must set exactly one of endpointId or endpointIdFile.";
+        }
       ];
     }
 
     (lib.mkIf (clientCfg.enable && clientTrustedBuilderPublicKeys != [ ]) {
       nix.settings.trusted-public-keys = lib.mkAfter clientTrustedBuilderPublicKeys;
+    })
+
+    (lib.mkIf (clientCfg.enable && clientCfg.builders != { }) {
+      environment.etc."drv-thru/builders.json".source = clientBuildersConfig;
     })
 
     (lib.mkIf clientCfg.enable {

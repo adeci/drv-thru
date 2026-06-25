@@ -101,28 +101,41 @@ services.drv-thru.server.trustedClients.alex = {
 };
 ```
 
-On the client, trust the builder's signing key globally:
+On the client, trust the builder's signing key:
 
 ```nix
 services.drv-thru.client = {
   enable = true;
-
   trustedBuilders.leviathan.publicKey = "drv-thru:builder-signing-public-key";
 };
+```
+
+Then save the builder address for your user:
+
+```sh
+mkdir -p ~/.config/drv-thru
+cat > ~/.config/drv-thru/builders.json <<'EOF'
+{
+  "builders": {
+    "leviathan": {
+      "endpoint_id": "builder-iroh-endpoint-id",
+      "relay_url": null
+    }
+  }
+}
+EOF
 ```
 
 On the builder, `drv-thru status` prints the server endpoint id. Then build without a ticket:
 
 ```sh
-drv-thru build nixpkgs#hello --server "builder-iroh-endpoint-id"
+drv-thru build nixpkgs#hello --builder leviathan
 ```
 
-If Iroh does not have address info for the builder yet, pass a relay URL:
+You can still pass the endpoint directly:
 
 ```sh
-drv-thru build nixpkgs#hello \
-  --server "builder-iroh-endpoint-id" \
-  --relay-url "https://use1-1.relay.n0.iroh.link./"
+drv-thru build nixpkgs#hello --server "builder-iroh-endpoint-id"
 ```
 
 ### Run Without Installing First
@@ -195,7 +208,9 @@ There are two separate trust decisions:
 
 Tickets and `server.trustedClients.*` control builder access.
 
-Nix trusted users, `client.trustedBuilders`, and `ticketHelper.trustedBuilderPublicKeys` control output import trust.
+A builder endpoint id is an address, not an auth secret. Keep it local if you do not want people probing reachability, but access still requires a trusted client key or a ticket. Named builders can live in `/etc/drv-thru/builders.json` from the NixOS module or in `~/.config/drv-thru/builders.json` for one user; the user file overrides the system file.
+
+Nix trusted users, `client.builders`, `client.trustedBuilders`, and `ticketHelper.trustedBuilderPublicKeys` control output import trust.
 
 A ticket alone is not enough for an untrusted multi-user Nix client to import outputs from a new builder. One of these must also be true:
 
@@ -242,7 +257,14 @@ services.drv-thru = {
     enable = true;
     narFetches = null; # auto
 
-    trustedBuilders.leviathan.publicKey = "drv-thru:builder-signing-public-key";
+    builders.leviathan = {
+      endpointId = null;
+      endpointIdFile = "/run/secrets/drv-thru-leviathan-endpoint-id";
+      relayUrl = null;
+      publicKey = "drv-thru:builder-signing-public-key";
+    };
+
+    trustedBuilders.other.publicKey = "drv-thru:other-builder-signing-public-key";
 
     ticketHelper = {
       enable = true; # defaults to client.enable
