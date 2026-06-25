@@ -112,10 +112,24 @@ enum TicketCommand {
         #[arg(long, default_value = "20G")]
         max_upload_bytes: String,
     },
+    List {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
     Inspect {
         #[arg(long)]
         data_dir: Option<PathBuf>,
         ticket: ticket::BuildTicket,
+    },
+    Reveal {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        ticket_id: String,
+    },
+    Revoke {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        ticket_id: String,
     },
 }
 
@@ -194,7 +208,16 @@ pub async fn run() -> Result<()> {
                 max_build_time,
                 max_upload_bytes,
             ),
+            TicketCommand::List { data_dir } => list_tickets(data_dir),
             TicketCommand::Inspect { data_dir, ticket } => inspect_ticket(data_dir, ticket),
+            TicketCommand::Reveal {
+                data_dir,
+                ticket_id,
+            } => reveal_ticket(data_dir, ticket_id),
+            TicketCommand::Revoke {
+                data_dir,
+                ticket_id,
+            } => revoke_ticket(data_dir, ticket_id),
         },
         Command::Status { data_dir, watch } => show_status(data_dir, watch).await,
         Command::ImportHelper {
@@ -305,6 +328,36 @@ fn create_ticket(
     Ok(())
 }
 
+fn list_tickets(data_dir: Option<PathBuf>) -> Result<()> {
+    let data_dir = data_dir.unwrap_or(default_data_dir()?);
+    let store = ticket::TicketStore::new(&data_dir);
+    let records = store.records().with_context(|| {
+        format!(
+            "read ticket state in {}; run as root, a wheel user, or pass --data-dir",
+            data_dir.display()
+        )
+    })?;
+
+    if records.is_empty() {
+        println!("no tickets");
+        return Ok(());
+    }
+
+    let now = now_unix_secs()?;
+    println!("id\tname\tstatus\tuses\texpires_unix\tbound_client");
+    for (id, record) in records {
+        println!(
+            "{id}\t{}\t{}\t{}\t{}\t{}",
+            record.name.as_deref().unwrap_or("-"),
+            ticket_record_status(&record, now),
+            format_uses(record.uses_remaining),
+            record.expires_at_unix,
+            record.bound_client.as_deref().unwrap_or("-"),
+        );
+    }
+    Ok(())
+}
+
 fn inspect_ticket(data_dir: Option<PathBuf>, build_ticket: ticket::BuildTicket) -> Result<()> {
     let data_dir = data_dir.unwrap_or(default_data_dir()?);
     let id = build_ticket.id();
@@ -340,6 +393,47 @@ fn inspect_ticket(data_dir: Option<PathBuf>, build_ticket: ticket::BuildTicket) 
         None => println!("store: ticket record not found"),
     }
     Ok(())
+}
+
+fn reveal_ticket(data_dir: Option<PathBuf>, ticket_id: String) -> Result<()> {
+    let data_dir = data_dir.unwrap_or(default_data_dir()?);
+    let store = ticket::TicketStore::new(&data_dir);
+    let record = store
+        .record(&ticket_id)
+        .with_context(|| {
+            format!(
+                "read ticket state in {}; run as root, a wheel user, or pass --data-dir",
+                data_dir.display()
+            )
+        })?
+        .with_context(|| format!("ticket not found: {ticket_id}"))?;
+    println!("{}", record.encoded_ticket);
+    Ok(())
+}
+
+fn revoke_ticket(data_dir: Option<PathBuf>, ticket_id: String) -> Result<()> {
+    let data_dir = data_dir.unwrap_or(default_data_dir()?);
+    let store = ticket::TicketStore::new(&data_dir);
+    store.revoke(&ticket_id).with_context(|| {
+        format!(
+            "revoke ticket in {}; run as root, a wheel user, or pass --data-dir",
+            data_dir.display()
+        )
+    })?;
+    println!("revoked ticket: {ticket_id}");
+    Ok(())
+}
+
+fn ticket_record_status(record: &ticket::TicketRecord, now: u64) -> &'static str {
+    if record.revoked {
+        "revoked"
+    } else if now >= record.expires_at_unix {
+        "expired"
+    } else if matches!(record.uses_remaining, Some(0)) {
+        "exhausted"
+    } else {
+        "active"
+    }
 }
 
 async fn show_status(data_dir: Option<PathBuf>, watch: bool) -> Result<()> {

@@ -136,6 +136,16 @@ Inspect a ticket:
 drv-thru ticket inspect "drvthru..."
 ```
 
+Manage stored tickets on the builder:
+
+```sh
+drv-thru ticket list
+drv-thru ticket reveal "ticket-id"
+drv-thru ticket revoke "ticket-id"
+```
+
+`list` does not print bearer secrets. `reveal` is explicit because it prints the pasteable ticket.
+
 Show local builder status:
 
 ```sh

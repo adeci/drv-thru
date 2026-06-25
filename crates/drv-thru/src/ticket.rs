@@ -114,6 +114,7 @@ impl BuildTicket {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TicketRecord {
+    pub encoded_ticket: String,
     pub created_at_unix: u64,
     pub name: Option<String>,
     pub expires_at_unix: u64,
@@ -177,9 +178,11 @@ impl TicketStore {
 
         let ticket = BuildTicket::generate(server_addr);
         let id = ticket.id();
+        let encoded_ticket = ticket.to_string();
         let old = state.tickets.insert(
             id.clone(),
             TicketRecord {
+                encoded_ticket,
                 created_at_unix: now,
                 name,
                 expires_at_unix: expires_at,
@@ -198,8 +201,32 @@ impl TicketStore {
         Ok(ticket)
     }
 
+    pub fn records(&self) -> Result<Vec<(String, TicketRecord)>> {
+        let mut records = self.load()?.tickets.into_iter().collect::<Vec<_>>();
+        records.sort_by(|(left_id, left), (right_id, right)| {
+            left.created_at_unix
+                .cmp(&right.created_at_unix)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        Ok(records)
+    }
+
     pub fn record(&self, id: &str) -> Result<Option<TicketRecord>> {
         Ok(self.load()?.tickets.get(id).cloned())
+    }
+
+    pub fn revoke(&self, id: &str) -> Result<TicketRecord> {
+        let _guard = self.lock.lock().expect("ticket store lock poisoned");
+        let _file_lock = self.lock_file()?;
+        let mut state = self.load_unlocked()?;
+        let record = state
+            .tickets
+            .get_mut(id)
+            .with_context(|| format!("ticket not found: {id}"))?;
+        record.revoked = true;
+        let revoked = record.clone();
+        self.write_unlocked(&state)?;
+        Ok(revoked)
     }
 
     pub fn check(&self, secret: &[u8; 32], remote: &EndpointId) -> Result<TicketRecord> {
@@ -532,6 +559,8 @@ mod tests {
             )
             .unwrap();
         let remote = SecretKey::generate().public();
+        let stored = store.record(&ticket.id()).unwrap().unwrap();
+        assert_eq!(stored.encoded_ticket, ticket.to_string());
 
         let record = store.redeem(&ticket.secret(), &remote).unwrap();
         assert_eq!(record.uses_remaining, Some(0));
@@ -576,6 +605,33 @@ mod tests {
                 .uses_remaining,
             Some(0)
         );
+
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn ticket_store_revokes_ticket() {
+        let data_dir = temp_data_dir("revokes-ticket");
+        let store = TicketStore::new(&data_dir);
+        let addr = EndpointAddr::new(SecretKey::generate().public());
+        let ticket = store
+            .create(
+                addr,
+                CreateTicket {
+                    name: Some("test".to_string()),
+                    expires_after: Duration::from_secs(60),
+                    uses_remaining: Some(1),
+                    max_build_time: "30m".to_string(),
+                    max_upload_bytes: "20G".to_string(),
+                },
+            )
+            .unwrap();
+        let remote = SecretKey::generate().public();
+
+        let revoked = store.revoke(&ticket.id()).unwrap();
+        assert!(revoked.revoked);
+        assert!(store.check(&ticket.secret(), &remote).is_err());
+        assert_eq!(store.records().unwrap().len(), 1);
 
         let _ = fs::remove_dir_all(data_dir);
     }
