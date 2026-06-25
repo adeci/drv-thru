@@ -159,6 +159,19 @@ Build with a ticket:
 drv-thru build nixpkgs#hello --ticket "drvthru..."
 ```
 
+If the requested top-level outputs are already valid in the local Nix store, drv-thru skips the remote builder and prints the local output paths.
+
+Use supported Nix flags:
+
+```sh
+NIXPKGS_ALLOW_UNSUPPORTED_SYSTEM=1 drv-thru build . --impure --ticket "drvthru..."
+drv-thru build . --refresh --ticket "drvthru..."
+drv-thru build . --override-input nixpkgs github:NixOS/nixpkgs/nixos-unstable --ticket "drvthru..."
+drv-thru build . --rebuild --ticket "drvthru..."
+```
+
+`--impure`, `--refresh`, and `--override-input` affect client-side evaluation before inputs are uploaded. `--rebuild` asks the remote builder to rebuild and check the derivation.
+
 Use plain logs instead of local `nom` rendering:
 
 ```sh

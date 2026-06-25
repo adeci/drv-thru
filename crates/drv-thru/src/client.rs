@@ -50,13 +50,33 @@ impl BuildAuth {
 
 pub async fn build(
     installable: String,
-    auth: BuildAuth,
+    auth: Option<BuildAuth>,
     key_file: Option<PathBuf>,
     output_mode: OutputMode,
     nar_fetches: Option<usize>,
+    eval_options: nix::EvalOptions,
+    rebuild: bool,
 ) -> Result<()> {
     let mut status = ClientStatus::new();
     let installable_label = installable.clone();
+
+    status.phase("resolving outputs");
+    let requested_outputs = nix::resolve_outputs(&installable_label, &eval_options).await?;
+    let requested_output_strings = requested_outputs
+        .iter()
+        .map(|path| path.as_str().to_string())
+        .collect::<Vec<_>>();
+
+    status.phase("checking local outputs");
+    if !rebuild && nix::missing_paths(&requested_outputs).await?.is_empty() {
+        status.clear_phase();
+        print_local_outputs_summary(&status, &installable_label, &requested_output_strings);
+        return Ok(());
+    }
+
+    let auth = auth.context(
+        "build requires either --server or --ticket when requested outputs are missing locally or --rebuild is set",
+    )?;
     let server_addr = auth.server_addr();
     let server_id = server_addr.id;
 
@@ -109,12 +129,7 @@ pub async fn build(
     client_cache::preflight_output_import(&builder_public_key).await?;
 
     status.phase("resolving derivation");
-    let drv_path = nix::resolve_derivation(&installable_label).await?;
-    let requested_outputs = nix::resolve_outputs(&installable_label).await?;
-    let requested_output_strings = requested_outputs
-        .iter()
-        .map(|path| path.as_str().to_string())
-        .collect::<Vec<_>>();
+    let drv_path = nix::resolve_derivation(&installable_label, &eval_options).await?;
 
     status.phase("checking closure");
     let closure_paths = nix::closure(&drv_path).await?;
@@ -131,6 +146,7 @@ pub async fn build(
             drv_path: drv_path.as_str().to_string(),
             output_paths: requested_output_strings,
             output_mode,
+            rebuild,
         }),
     )
     .await?;
@@ -476,6 +492,26 @@ struct BuildSummary<'a> {
     build_success: bool,
     output_paths: &'a [String],
     received_bytes: u64,
+}
+
+fn print_local_outputs_summary(status: &ClientStatus, installable: &str, output_paths: &[String]) {
+    status.suspend(|| {
+        println!("drv-thru: outputs already present locally");
+        println!();
+        println!("{:<12} {}", "installable", installable);
+        println!(
+            "{:<12} {} {}",
+            "outputs",
+            output_paths.len(),
+            path_word(output_paths.len())
+        );
+        println!("{:<12} skipped", "remote");
+        println!();
+        println!("output paths:");
+        for path in output_paths {
+            println!("{path}");
+        }
+    });
 }
 
 fn print_build_summary(status: &ClientStatus, summary: BuildSummary<'_>) {

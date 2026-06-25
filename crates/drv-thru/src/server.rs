@@ -63,6 +63,7 @@ struct CheckedBuildRequest {
     installable: String,
     drv_path: nix::StorePath,
     output_mode: OutputMode,
+    rebuild: bool,
     closure_paths: Vec<nix::StorePath>,
     output_paths: Vec<nix::StorePath>,
 }
@@ -505,6 +506,7 @@ fn handle_build_request(
         installable: request.installable,
         drv_path,
         output_mode: request.output_mode,
+        rebuild: request.rebuild,
         closure_paths,
         output_paths,
     })
@@ -540,11 +542,19 @@ async fn run_queued_build(
         import_missing_inputs(conn, send, &missing_paths, authorized.max_upload_bytes).await?;
     }
 
-    status.registry.phase(status.request_id, "building");
+    status.registry.phase(
+        status.request_id,
+        if build.rebuild {
+            "rebuilding"
+        } else {
+            "building"
+        },
+    );
     let finished = run_build(
         send,
         &build.drv_path,
         build.output_mode,
+        build.rebuild,
         authorized.max_build_time,
         &build.output_paths,
     )
@@ -564,13 +574,14 @@ async fn run_build(
     send: &mut SendStream,
     drv_path: &nix::StorePath,
     output_mode: OutputMode,
+    rebuild: bool,
     max_build_time: Option<Duration>,
     requested_outputs: &[nix::StorePath],
 ) -> Result<FinishedBuild> {
     wire::write_json(send, &Message::BuildStarted).await?;
 
     let mut log_sink = WireLogSink { send };
-    let build = nix::realise(drv_path, output_mode, &mut log_sink);
+    let build = nix::realise(drv_path, output_mode, rebuild, &mut log_sink);
     let result = match max_build_time {
         Some(max_build_time) => tokio::time::timeout(max_build_time, build)
             .await

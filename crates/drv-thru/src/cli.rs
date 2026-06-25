@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use crate::{
     client::{self, BuildAuth},
     config::{parse_byte_count, parse_duration},
-    import_helper, keys,
+    import_helper, keys, nix,
     proto::OutputMode,
     server, ticket,
 };
@@ -60,6 +60,19 @@ enum Command {
             help = "Parallel NAR payload fetches for local cache mirroring. Defaults to auto; DRV_THRU_NAR_FETCHES is also honored."
         )]
         nar_fetches: Option<usize>,
+        #[arg(long, help = "Pass --impure to client-side Nix evaluation.")]
+        impure: bool,
+        #[arg(long, help = "Pass --refresh to client-side Nix evaluation.")]
+        refresh: bool,
+        #[arg(
+            long = "override-input",
+            value_names = ["INPUT_PATH", "FLAKE_URL"],
+            num_args = 2,
+            help = "Pass --override-input to client-side Nix evaluation. Can be repeated."
+        )]
+        override_input: Vec<String>,
+        #[arg(long, help = "Ask the builder to rebuild and check the derivation.")]
+        rebuild: bool,
     },
     Ticket {
         #[command(subcommand)]
@@ -178,6 +191,10 @@ pub async fn run() -> Result<()> {
             key_file,
             no_nom,
             nar_fetches,
+            impure,
+            refresh,
+            override_input,
+            rebuild,
         } => {
             let output_mode = if no_nom {
                 OutputMode::Plain
@@ -188,7 +205,16 @@ pub async fn run() -> Result<()> {
                 bail!("--nar-fetches must be at least 1");
             }
             let auth = build_auth(server, relay_url, ticket)?;
-            client::build(installable, auth, key_file, output_mode, nar_fetches).await
+            client::build(
+                installable,
+                auth,
+                key_file,
+                output_mode,
+                nar_fetches,
+                eval_options(impure, refresh, override_input)?,
+                rebuild,
+            )
+            .await
         }
         Command::Ticket { command } => match command {
             TicketCommand::Create {
@@ -258,11 +284,34 @@ fn ensure_data_dir_accessible(path: &Path) -> Result<()> {
     fs::remove_file(&probe).with_context(|| format!("remove {}", probe.display()))
 }
 
+fn eval_options(
+    impure: bool,
+    refresh: bool,
+    override_input: Vec<String>,
+) -> Result<nix::EvalOptions> {
+    let pairs = override_input.chunks_exact(2);
+    if !pairs.remainder().is_empty() {
+        bail!("--override-input requires INPUT_PATH and FLAKE_URL");
+    }
+    let override_inputs = pairs
+        .map(|chunk| nix::OverrideInput {
+            input_path: chunk[0].clone(),
+            flake_url: chunk[1].clone(),
+        })
+        .collect::<Vec<_>>();
+
+    Ok(nix::EvalOptions {
+        impure,
+        refresh,
+        override_inputs,
+    })
+}
+
 fn build_auth(
     server: Option<iroh::EndpointId>,
     relay_url: Option<iroh::RelayUrl>,
     ticket: Option<ticket::BuildTicket>,
-) -> Result<BuildAuth> {
+) -> Result<Option<BuildAuth>> {
     if ticket.is_some() && relay_url.is_some() {
         bail!("--relay-url cannot be used with --ticket");
     }
@@ -271,12 +320,12 @@ fn build_auth(
     }
 
     match (server, ticket) {
-        (Some(server_id), None) => Ok(BuildAuth::TrustedClient {
+        (Some(server_id), None) => Ok(Some(BuildAuth::TrustedClient {
             server_id,
             relay_url,
-        }),
-        (None, Some(ticket)) => Ok(BuildAuth::Ticket(ticket)),
-        (None, None) => bail!("build requires either --server or --ticket"),
+        })),
+        (None, Some(ticket)) => Ok(Some(BuildAuth::Ticket(ticket))),
+        (None, None) => Ok(None),
         (Some(_), Some(_)) => bail!("--server and --ticket cannot be used together"),
     }
 }

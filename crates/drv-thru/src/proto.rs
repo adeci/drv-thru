@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-pub const ALPN: &[u8] = b"drv-thru/3";
-pub const VERSION: u32 = 3;
+pub const ALPN: &[u8] = b"drv-thru/4";
+pub const VERSION: u32 = 4;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -59,6 +59,7 @@ pub struct BuildRequest {
     pub drv_path: String,
     pub output_paths: Vec<String>,
     pub output_mode: OutputMode,
+    pub rebuild: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -18,6 +18,18 @@ const HASH_LEN: usize = 32;
 const NIX_BASE32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
 const PATH_ARG_CHUNK_SIZE: usize = 512;
 
+#[derive(Default)]
+pub struct EvalOptions {
+    pub impure: bool,
+    pub refresh: bool,
+    pub override_inputs: Vec<OverrideInput>,
+}
+
+pub struct OverrideInput {
+    pub input_path: String,
+    pub flake_url: String,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct StorePath(String);
 
@@ -33,8 +45,9 @@ impl StorePath {
     }
 }
 
-pub async fn resolve_derivation(installable: &str) -> Result<StorePath> {
-    let output = run_command("nix", &["path-info", "--derivation", installable]).await?;
+pub async fn resolve_derivation(installable: &str, options: &EvalOptions) -> Result<StorePath> {
+    let args = eval_args(&["path-info", "--derivation"], installable, options);
+    let output = run_command("nix", &args).await?;
     let path = output
         .lines()
         .find_map(non_empty_line)
@@ -42,8 +55,9 @@ pub async fn resolve_derivation(installable: &str) -> Result<StorePath> {
     StorePath::new(path)
 }
 
-pub async fn resolve_outputs(installable: &str) -> Result<Vec<StorePath>> {
-    let output = run_command("nix", &["build", "--dry-run", "--json", installable]).await?;
+pub async fn resolve_outputs(installable: &str, options: &EvalOptions) -> Result<Vec<StorePath>> {
+    let args = eval_args(&["build", "--dry-run", "--json"], installable, options);
+    let output = run_command("nix", &args).await?;
     parse_build_plan_outputs(&output)
 }
 
@@ -60,6 +74,23 @@ fn parse_build_plan_outputs(output: &str) -> Result<Vec<StorePath>> {
         .into_values()
         .map(StorePath::new)
         .collect()
+}
+
+fn eval_args<'a>(base: &[&'a str], installable: &'a str, options: &'a EvalOptions) -> Vec<&'a str> {
+    let mut args = base.to_vec();
+    if options.impure {
+        args.push("--impure");
+    }
+    if options.refresh {
+        args.push("--refresh");
+    }
+    for input in &options.override_inputs {
+        args.push("--override-input");
+        args.push(input.input_path.as_str());
+        args.push(input.flake_url.as_str());
+    }
+    args.push(installable);
+    args
 }
 
 #[derive(serde::Deserialize)]
@@ -117,13 +148,14 @@ pub async fn missing_paths(paths: &[StorePath]) -> Result<Vec<StorePath>> {
 pub async fn realise<S>(
     path: &StorePath,
     output_mode: OutputMode,
+    rebuild: bool,
     log_sink: &mut S,
 ) -> Result<RealiseResult>
 where
     S: LogSink + ?Sized,
 {
     let mut child = Command::new("nix-store")
-        .args(realise_args(output_mode))
+        .args(realise_args(output_mode, rebuild))
         .arg(path.as_str())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -535,11 +567,16 @@ where
     Ok(())
 }
 
-fn realise_args(output_mode: OutputMode) -> [&'static str; 4] {
-    match output_mode {
-        OutputMode::Nom => ["--realise", "--log-format", "internal-json", "-v"],
-        OutputMode::Plain => ["--realise", "--log-format", "raw", "-v"],
+fn realise_args(output_mode: OutputMode, rebuild: bool) -> Vec<&'static str> {
+    let mut args = vec!["--realise"];
+    if rebuild {
+        args.push("--check");
     }
+    match output_mode {
+        OutputMode::Nom => args.extend(["--log-format", "internal-json", "-v"]),
+        OutputMode::Plain => args.extend(["--log-format", "raw", "-v"]),
+    }
+    args
 }
 
 fn validate_store_path(path: &str) -> Result<()> {
@@ -626,6 +663,45 @@ mod tests {
         ] {
             assert!(StorePath::new(path).is_err(), "accepted {path}");
         }
+    }
+
+    #[test]
+    fn maps_eval_options_to_nix_args() {
+        let options = EvalOptions {
+            impure: true,
+            refresh: true,
+            override_inputs: vec![OverrideInput {
+                input_path: "nixpkgs".to_string(),
+                flake_url: "github:NixOS/nixpkgs/nixos-unstable".to_string(),
+            }],
+        };
+
+        assert_eq!(
+            eval_args(&["build", "--dry-run", "--json"], ".#pkg", &options),
+            vec![
+                "build",
+                "--dry-run",
+                "--json",
+                "--impure",
+                "--refresh",
+                "--override-input",
+                "nixpkgs",
+                "github:NixOS/nixpkgs/nixos-unstable",
+                ".#pkg",
+            ]
+        );
+    }
+
+    #[test]
+    fn maps_rebuild_to_nix_store_check() {
+        assert_eq!(
+            realise_args(OutputMode::Plain, true),
+            vec!["--realise", "--check", "--log-format", "raw", "-v"]
+        );
+        assert_eq!(
+            realise_args(OutputMode::Nom, false),
+            vec!["--realise", "--log-format", "internal-json", "-v"]
+        );
     }
 
     #[test]
