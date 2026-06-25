@@ -200,7 +200,7 @@ fn choose_output_import_method(
 }
 
 fn output_import_setup_error(
-    direct_import_error: &str,
+    _direct_import_error: &str,
     helper_socket_status: import_helper::HelperSocketStatus,
 ) -> String {
     let helper_socket = import_helper::DEFAULT_SOCKET_PATH;
@@ -224,18 +224,17 @@ fn output_import_setup_error(
     };
 
     format!(
-        "This client is not set up to import outputs from this ticket builder.\n\n\
-         This user is not a trusted Nix user, and this builder key is not trusted by local Nix config.\n\
-         For one-off ticket builds, either add the user to `nix.settings.trusted-users` or enable the drv-thru import helper.\n\n\
+        "This client cannot import outputs from this ticket builder.\n\n\
+         Nix does not trust this builder key for the current user, and no usable drv-thru import helper is available.\n\
          {helper_status}\n\n\
-         Helper setup for normal multi-user Nix clients:\n\n\
+         For one-off tickets on normal multi-user NixOS clients, install the helper:\n\n\
            services.drv-thru.client.enable = true;\n\
            services.drv-thru.client.ticketHelper.enable = true;\n\
            users.users.<name>.extraGroups = [ \"drv-thru\" ];\n\n\
-         Then rebuild, log out and back in, and retry.\n\n\
-         Other option: add the builder key to `nix.settings.trusted-public-keys`.\n\n\
-         Running `nix run github:adeci/drv-thru#drv-thru` only runs the CLI; it does not install the helper or change Nix trust.\n\n\
-         Nix preflight detail:\n{direct_import_error}"
+         Then rebuild, log out and back in if group membership changed, and retry.\n\n\
+         For a persistent trusted builder, add its signing key to:\n\n\
+           services.drv-thru.client.trustedBuilders.<name>.publicKey\n\n\
+         `nix run github:adeci/drv-thru#drv-thru` only runs the CLI; it does not install the helper or change Nix trust."
     )
 }
 
@@ -492,9 +491,10 @@ mod tests {
         )
         .expect_err("expected setup failure");
 
-        assert!(err.contains("setup required"));
+        assert!(err.contains("This client cannot import outputs"));
         assert!(err.contains("No drv-thru import helper socket was found"));
         assert!(err.contains("services.drv-thru.client.ticketHelper.enable = true"));
+        assert!(err.contains("services.drv-thru.client.trustedBuilders.<name>.publicKey"));
         assert!(err.contains("nix run github:adeci/drv-thru#drv-thru"));
     }
 
